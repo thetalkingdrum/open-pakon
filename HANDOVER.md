@@ -46,3 +46,6 @@ PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:$PATH" cargo build --offlin
 2. **Test live scanning + A/B comparison:**
    - Run a live scan on the scanner machine and compare **PSI 3 (Ansel)** vs **PSI 2.4 (KCDFS)** exports (16-bit TIFF and JPEG).
    - Re-test the TLX `.raw` rolls (`RAW max 800`, `yashica T5 raw with header`) once the real scanner EEPROM is archived.
+
+3. **PSI 2.4 RE & Ground-Truth Notes:**
+   - See `docs/PSI24_RE_NOTES.md` for full disassembly addresses (`TLXClientDemo.exe`, PSI 2.4 `TLB.dll`, `oem/psi24/PakonIMAu.dll`), ground-truth comparison against `F135PLUS-17157` (`000001`), and the next target (`0x10068c30` / `0x10023d89`) for matching `real 2.4`'s ~1.4× contrast / shadow toe.
