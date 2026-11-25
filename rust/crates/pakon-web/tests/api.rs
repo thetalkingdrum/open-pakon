@@ -92,7 +92,9 @@ async fn routes_without_a_scanner() {
     assert_eq!(v, json!([{"type": "error", "message": "No raw file — run a scan or open a .raw file"}]));
     let (s, v) = call(&r, "POST", "/api/autoframe", Some(json!({"format": "full"}))).await;
     assert_eq!((s, v), (StatusCode::BAD_REQUEST, json!({"error": "Process a roll first"})));
-    let (_, v) = call(&r, "POST", "/api/export_frames", Some(json!({"centres": [1]}))).await;
+    let (_, v) = call(&r, "POST", "/api/adjust/open", Some(json!({"centres": [1], "color_engine": "psi24"}))).await;
+    assert_eq!(v, json!([{"type": "error", "message": "Run a scan/process first"}]));
+    let (_, v) = call(&r, "POST", "/api/export_frames", Some(json!({"centres": [1], "color_engine": "psi24"}))).await;
     assert_eq!(v, json!([{"type": "error", "message": "Run a scan/process first"}]));
     let (_, v) = call(&r, "POST", "/api/save", Some(json!({"fmt": "bmp"}))).await;
     assert_eq!(v, json!([{"type": "error", "message": "unknown format: bmp"}]));
@@ -112,7 +114,14 @@ async fn routes_without_a_scanner() {
     assert_eq!((s, v), (StatusCode::OK, json!({"path": raw, "film": "slide", "format": "full", "dx": null})));
     let (s, v) = call(&r, "POST", "/api/open", Some(json!({"path": work.join("y.txt")}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
-    assert!(v["error"].as_str().unwrap().starts_with("not a .raw file: "));
+    assert!(v["error"].as_str().unwrap().starts_with("not a .raw or .pakscan file: "));
+    let pakscan = work.join("roll.pakscan");
+    std::fs::write(&pakscan, b"").unwrap();
+    let (s, v) = call(&r, "POST", "/api/open", Some(json!({"path": pakscan}))).await;
+    assert_eq!((s, v), (StatusCode::OK, json!({"path": pakscan, "film": "c41", "format": "full", "dx": null})));
+    // restore roll.raw for the folder assertion below
+    let (s, _) = call(&r, "POST", "/api/open", Some(json!({"path": raw}))).await;
+    assert_eq!(s, StatusCode::OK);
     let (_, v) = call(&r, "GET", "/api/frames", None).await;
     assert_eq!(v["folder"], json!(work.join("roll")));
 

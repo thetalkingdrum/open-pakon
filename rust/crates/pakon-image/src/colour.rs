@@ -38,6 +38,18 @@ pub fn pos_matrix_default() -> Matrix {
     m
 }
 
+/// PSI 2.4's generic 3x4 linear negative matrix (`_ClientColNegMat.txt`,
+/// scaled by 1/4 from 14-bit to 12-bit RPD density space, with the standard
+/// F-135 RPD baseline intercepts so `sba-CN-psi24.dpi` balances cleanly when
+/// no per-unit EEPROM archive is present).
+pub fn psi24_neg_matrix_default() -> Matrix {
+    [
+        [1.11882 / 4.0, -0.10130 / 4.0, -0.01161 / 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 164.0],
+        [-0.20096 / 4.0, 1.10082 / 4.0, 0.11698 / 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 435.0],
+        [-0.11657 / 4.0, 0.04834 / 4.0, 1.08274 / 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 645.0],
+    ]
+}
+
 /// `m0 R + m1 G + m2 B + m3 R² + m4 G² + m5 B² + m6 RG + m7 BR + m8 GB + m9`
 /// in numpy's order.
 #[inline]

@@ -52,6 +52,39 @@ impl FilmKind {
     }
 }
 
+/// Colour rendering engine: PSI 3.x (Kodak Ansel + PSI 3 rpd.pf) or PSI 2.4
+/// (KCDFS SBA tuning + PSI 2.4 `PdenX1000_kpt1-gs1_3.pf`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorEngine {
+    #[default]
+    Psi3,
+    Psi24,
+}
+
+impl ColorEngine {
+    pub fn rpd_profile_name(self) -> &'static str {
+        match self {
+            ColorEngine::Psi3 => "rpd.pf",
+            ColorEngine::Psi24 => "rpd_24.pf",
+        }
+    }
+
+    pub fn rpd_table_bytes(self) -> &'static [u8] {
+        match self {
+            ColorEngine::Psi3 => pakon_image::RPD_TABLE_U8,
+            ColorEngine::Psi24 => pakon_image::RPD24_TABLE_U8,
+        }
+    }
+
+    pub fn sba_dpi_override(self) -> Option<&'static str> {
+        match self {
+            ColorEngine::Psi3 => None,
+            ColorEngine::Psi24 => Some("sba-CN-psi24.dpi"),
+        }
+    }
+}
+
 /// Export sharpening for the whole roll: the OEM's unsharp mask at 1, 2 and
 /// 3 TLX clicks.
 pub const SHARPEN_LEVELS: [(&str, i32); 4] = [("off", 0), ("low", 67), ("medium", 133), ("high", 200)];
@@ -203,18 +236,34 @@ impl Env {
     }
 
     /// (NegMatrix, LUT, rpd.pf table) for the OEM colour path, or None
-    /// without an EEPROM archive or rpd.pf (`_oem_path`).
+    /// without an EEPROM archive or rpd profile (`_oem_path`).
     pub fn oem_path(&self) -> Option<Oem> {
-        let dir = self.eeprom_dir.as_ref()?;
-        if !self.rpd_profile().is_file() {
+        self.oem_path_for(ColorEngine::Psi3)
+    }
+
+    /// Like [`oem_path`](Self::oem_path), selecting the RPD profile and table
+    /// for `engine` (PSI 3.x or PSI 2.4). When no EEPROM archive is present,
+    /// PSI 2.4 falls back to its generic `_ClientColNegMat.txt` linear matrix
+    /// so offline `.pakscan` / `.raw` rolls still render through `rpd_24.pf`.
+    pub fn oem_path_for(&self, engine: ColorEngine) -> Option<Oem> {
+        if !self.profiles().join(engine.rpd_profile_name()).is_file() {
             return None;
         }
-        let copies = pakon_proto::eeprom::load_dir(dir);
-        let e = pakon_proto::eeprom::decode(pakon_proto::eeprom::as_refs(&copies));
-        if !e.decodable {
-            return None;
-        }
-        Some(Oem { negmat: e.neg_matrix, lut: colour::c41_lut(), table: Table::from_u8(52, pakon_image::RPD_TABLE_U8).ok()? })
+        let negmat = match &self.eeprom_dir {
+            Some(dir) => {
+                let copies = pakon_proto::eeprom::load_dir(dir);
+                let e = pakon_proto::eeprom::decode(pakon_proto::eeprom::as_refs(&copies));
+                if !e.decodable {
+                    return None;
+                }
+                e.neg_matrix
+            }
+            None => match engine {
+                ColorEngine::Psi3 => return None,
+                ColorEngine::Psi24 => colour::psi24_neg_matrix_default(),
+            },
+        };
+        Some(Oem { negmat, lut: colour::c41_lut(), table: Table::from_u8(52, engine.rpd_table_bytes()).ok()? })
     }
 
     /// The slide path: the unit's PosMatrix when its archive decodes, else
@@ -673,6 +722,8 @@ pub struct ExportRequest {
     pub adjustments: Option<Vec<Option<Adjust>>>,
     /// Per-frame turn and flip (none: as scanned).
     pub orient: Option<Vec<Orient>>,
+    /// Colour engine (PSI 3.x Ansel or PSI 2.4 KCDFS).
+    pub color_engine: ColorEngine,
 }
 
 /// The files written for one frame.
@@ -741,6 +792,7 @@ struct Renderer {
     flare: Option<[f32; 3]>,
     rpd_balance: Option<[[f32; 3]; 2]>,
     profiles: PathBuf,
+    rpd_profile_name: &'static str,
     slide: Option<slide::SlidePath>,
     oem: Option<Oem>,
     lut: Vec<f32>,
@@ -760,14 +812,17 @@ impl Renderer {
         roll: Option<&[ArrayView3<u16>]>,
         progress: Option<Progress>,
     ) -> Result<Renderer, String> {
+        let engine = req.color_engine;
+        let rpd_profile_name = engine.rpd_profile_name();
         let slide = if req.film == FilmKind::Slide { Some(env.slide_path()?) } else { None };
-        let oem = env.oem_path();
+        let oem = env.oem_path_for(engine);
         let mut shifts = None;
         if slide.is_none() {
             if oem.is_some() && env.sba_on() {
                 emit(progress, "OEM scene balance", 0.0);
             }
-            shifts = sba_shifts(env, crops, oem.as_ref(), roll, req.sba_dpi.as_deref(), req.scene_dmin);
+            let dpi = engine.sba_dpi_override().or(req.sba_dpi.as_deref());
+            shifts = sba_shifts(env, crops, oem.as_ref(), roll, dpi, req.scene_dmin);
         }
         Ok(Renderer {
             grey: req.film.grey(),
@@ -775,10 +830,11 @@ impl Renderer {
             flare: req.flare,
             rpd_balance: req.rpd_balance,
             profiles: env.profiles(),
+            rpd_profile_name,
             slide,
             oem,
             lut: colour::c41_lut(),
-            rpd_jpeg: env.rpd_profile().is_file().then(|| Table::from_u8(52, pakon_image::RPD_TABLE_U8).ok()).flatten(),
+            rpd_jpeg: env.profiles().join(rpd_profile_name).is_file().then(|| Table::from_u8(52, engine.rpd_table_bytes()).ok()).flatten(),
             shifts,
             tables: Mutex::new(HashMap::new()),
         })
@@ -816,7 +872,7 @@ impl Renderer {
                 None => self.rpd_balance.map(|b| Balance { gain: b[0], offset: b[1] }),
             };
             let t = match adj {
-                Some(a) if a.saturation != 0 || a.tone != Tone::None => Some(self.table_for(&o.table, &self.profiles.join("rpd.pf"), a)?),
+                Some(a) if a.saturation != 0 || a.tone != Tone::None => Some(self.table_for(&o.table, &self.profiles.join(self.rpd_profile_name), a)?),
                 _ => None,
             };
             let out = colour::render_oem(part, &o.negmat, &o.lut, t.as_deref().unwrap_or(&o.table), bal.as_ref(), adj, grey);
