@@ -219,10 +219,23 @@ pub struct Balance {
 
 /// RPD plus the 12-bit adjustments, all but the unsharp mask (C `rpd_pixel`).
 #[inline]
-fn rpd_adjusted(px: &[u16], m: &Matrix, lut: &[f32], contrast: f32, bal: Option<&Balance>, off: Option<&[f32; 3]>) -> [f32; 3] {
+fn rpd_adjusted(
+    px: &[u16],
+    m: &Matrix,
+    lut: &[f32],
+    contrast: f32,
+    scp_luts: Option<&[[u16; 4096]; 3]>,
+    bal: Option<&Balance>,
+    off: Option<&[f32; 3]>,
+) -> [f32; 3] {
     let d: [f32; 3] = std::array::from_fn(|c| density_lut(px[c] as f32, lut));
     std::array::from_fn(|c| {
         let mut o = poly(&m[c], d[0], d[1], d[2]).clamp(0.0, 4095.0);
+        if let Some(scp) = scp_luts {
+            let i0 = (o as usize).min(4094);
+            let frac = o - i0 as f32;
+            o = (scp[c][i0] as f32 + frac * (scp[c][i0 + 1] as f32 - scp[c][i0] as f32)).clamp(0.0, 4095.0);
+        }
         if contrast != 0.0 {
             o = ((o - CONTRAST_PIVOT) * contrast / 1000.0 + CONTRAST_PIVOT).clamp(0.0, 4095.0);
         }
@@ -254,6 +267,22 @@ pub fn render_oem(
     adj: Option<&Adjust>,
     grey: bool,
 ) -> Array3<u16> {
+    render_oem_scp(rgb, m, lut, table, None, bal, adj, grey)
+}
+
+/// Like [`render_oem`], applying optional KCDFS per-channel 12-bit SCP LUTs
+/// in RPD space before the scene-balance offset.
+#[allow(clippy::too_many_arguments)]
+pub fn render_oem_scp(
+    rgb: ArrayView3<u16>,
+    m: &Matrix,
+    lut: &[f32],
+    table: &Table,
+    scp_luts: Option<&[[u16; 4096]; 3]>,
+    bal: Option<&Balance>,
+    adj: Option<&Adjust>,
+    grey: bool,
+) -> Array3<u16> {
     let (h, w, _) = rgb.dim();
     let contrast = adj.map_or(0.0, |a| a.contrast_slope());
     let off = adj.map(|a| a.offsets());
@@ -270,7 +299,7 @@ pub fn render_oem(
         let mut v = Vec::with_capacity(3 * w);
         for x in 0..w {
             let p = row.index_axis(Axis(0), x);
-            v.extend(rpd_adjusted(p.as_slice().unwrap(), m, lut, contrast, bal, off.as_ref()));
+            v.extend(rpd_adjusted(p.as_slice().unwrap(), m, lut, contrast, scp_luts, bal, off.as_ref()));
         }
         v
     };

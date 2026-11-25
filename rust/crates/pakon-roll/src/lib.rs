@@ -20,7 +20,7 @@ use pakon_image::film::{Film, ProdTable};
 use pakon_image::framing::{self, Format};
 use pakon_image::output::{self, Picture16};
 use pakon_image::{adjust, balance, fallback, film, ice, ribbon, slide};
-use pakon_oem::{dice, sba};
+use pakon_oem::{dice, kcdfs, sba};
 use serde::{Deserialize, Serialize};
 
 pub mod strips;
@@ -230,6 +230,11 @@ impl Env {
         self.sba && sba::default_dll(&self.repo).is_file() && sba::sba_dir(&self.repo).is_dir()
     }
 
+    /// PSI 2.4 KCDFS scene balance can run: SBA on, and `oem/psi24/` exists.
+    pub fn kcdfs_on(&self) -> bool {
+        self.sba && kcdfs::default_dll(&self.repo).is_file() && kcdfs::kcdfs_dir(&self.repo).is_dir()
+    }
+
     /// The OEM Digital ICE can run.
     pub fn dice_on(&self) -> bool {
         self.dice && self.dice_dll.is_file()
@@ -424,6 +429,34 @@ fn sba_shifts(env: &Env, crops: &[ArrayView3<u16>], oem: Option<&Oem>, roll: Opt
         Ok(s) => Some(s),
         Err(e) => {
             eprintln!("OEM SBA failed, using the roll balance: {e}");
+            None
+        }
+    }
+}
+
+/// PSI 2.4 KCDFS per-frame RPD shifts and roll SCP LUTs; None when `oem/psi24/`
+/// is absent or fails (caller falls back to Ansel `sba-CN-psi24.dpi`).
+fn kcdfs_balance(
+    env: &Env,
+    crops: &[ArrayView3<u16>],
+    oem: Option<&Oem>,
+    roll: Option<&[ArrayView3<u16>]>,
+    dmin: Option<[i64; 3]>,
+) -> Option<kcdfs::KcdfsRollResult> {
+    let oem = oem?;
+    if crops.is_empty() || !env.kcdfs_on() {
+        return None;
+    }
+    let analysis = |c: &ArrayView3<u16>| sba::analysis_image(c.view(), &oem.negmat, &oem.lut);
+    let run = || -> Result<kcdfs::KcdfsRollResult, String> {
+        let imgs: Vec<Array3<i16>> = crops.iter().map(analysis).collect();
+        let roll: Option<Vec<Array3<i16>>> = roll.map(|r| r.iter().map(analysis).collect());
+        kcdfs::roll_balance_against(&kcdfs::default_dll(&env.repo), &kcdfs::kcdfs_dir(&env.repo), &imgs, roll.as_deref(), dmin, true)
+    };
+    match run() {
+        Ok(res) => Some(res),
+        Err(e) => {
+            eprintln!("OEM KCDFS failed, falling back to Ansel SBA: {e}");
             None
         }
     }
@@ -798,6 +831,7 @@ struct Renderer {
     lut: Vec<f32>,
     rpd_jpeg: Option<Table>,
     shifts: Option<Vec<[f32; 3]>>,
+    scp_luts: Option<Box<[[u16; 4096]; 3]>>,
     /// Saturation / tone tables, built once per (saturation, tone).
     tables: Mutex<HashMap<(i32, Tone), std::sync::Arc<Table>>>,
 }
@@ -817,12 +851,21 @@ impl Renderer {
         let slide = if req.film == FilmKind::Slide { Some(env.slide_path()?) } else { None };
         let oem = env.oem_path_for(engine);
         let mut shifts = None;
+        let mut scp_luts = None;
         if slide.is_none() {
-            if oem.is_some() && env.sba_on() {
+            if oem.is_some() && (env.sba_on() || (engine == ColorEngine::Psi24 && env.kcdfs_on())) {
                 emit(progress, "OEM scene balance", 0.0);
             }
-            let dpi = engine.sba_dpi_override().or(req.sba_dpi.as_deref());
-            shifts = sba_shifts(env, crops, oem.as_ref(), roll, dpi, req.scene_dmin);
+            if engine == ColorEngine::Psi24 {
+                if let Some(res) = kcdfs_balance(env, crops, oem.as_ref(), roll, req.scene_dmin) {
+                    shifts = Some(res.shifts);
+                    scp_luts = res.scp_luts;
+                }
+            }
+            if shifts.is_none() {
+                let dpi = engine.sba_dpi_override().or(req.sba_dpi.as_deref());
+                shifts = sba_shifts(env, crops, oem.as_ref(), roll, dpi, req.scene_dmin);
+            }
         }
         Ok(Renderer {
             grey: req.film.grey(),
@@ -836,6 +879,7 @@ impl Renderer {
             lut: colour::c41_lut(),
             rpd_jpeg: env.profiles().join(rpd_profile_name).is_file().then(|| Table::from_u8(52, engine.rpd_table_bytes()).ok()).flatten(),
             shifts,
+            scp_luts,
             tables: Mutex::new(HashMap::new()),
         })
     }
@@ -875,7 +919,7 @@ impl Renderer {
                 Some(a) if a.saturation != 0 || a.tone != Tone::None => Some(self.table_for(&o.table, &self.profiles.join(self.rpd_profile_name), a)?),
                 _ => None,
             };
-            let out = colour::render_oem(part, &o.negmat, &o.lut, t.as_deref().unwrap_or(&o.table), bal.as_ref(), adj, grey);
+            let out = colour::render_oem_scp(part, &o.negmat, &o.lut, t.as_deref().unwrap_or(&o.table), self.scp_luts.as_deref(), bal.as_ref(), adj, grey);
             let keep_colour = adj.is_some_and(|a| a.tone != Tone::None);
             let pos = if grey && !keep_colour { Picture16Owned::Grey(colour::to_grey(out.view())) } else { Picture16Owned::Rgb(out) };
             let r = output::to_u8(&pos.picture());
