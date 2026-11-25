@@ -810,18 +810,19 @@ impl Kcdfs {
 
         let dmin_a = e.alloc(8, Some(&le_i16s(&dmin)))?;
         let dmin_b = e.alloc(8, Some(&le_i16s(&dmin)))?;
+        let zero_dmin = e.alloc(8, Some(&le_i16s(&[0, 0, 0])))?;
         // 3x3 identity scaled by 1000 (0x3E8), matching stack layout at 10001951..10001a95.
         let id_mat: [i16; 9] = [1000, 0, 0, 0, 1000, 0, 0, 0, 1000];
         let mat_buf = e.alloc(20, Some(&le_i16s(&id_mat)))?;
         let alg_ptr = e.alloc(4, Some(&alg.to_le_bytes()))?;
 
-        // createAlgData(image, &alg_ptr, 0, 0, &dmin_a, G_GEOMETRY, G_SETUP_REC, dmin_b, dmin_a, 0, info[1], G_MINDMIN)
-        // Matching exact push order at 10001a1c..10001a9b:
+        // createAlgData(image, &alg_ptr, 0, 0, out_stats, G_GEOMETRY, G_SETUP_REC, dmin_b, zero_dmin, 0, info[1], G_MINDMIN)
+        // Matching exact push order at 10001a1c..10001a9b (dmin_a is NOT passed here; it is read untouched by _sbaCalcDens).
         let out_stats = e.alloc(16, None)?;
         check(
             e.call(
                 F_CREATE_ALG,
-                &[image, alg_ptr, 0, 0, out_stats, G_GEOMETRY, G_SETUP_REC, dmin_a, dmin_b, 0, CMD_DEFAULTS[1] as u32, G_MINDMIN],
+                &[image, alg_ptr, 0, 0, out_stats, G_GEOMETRY, G_SETUP_REC, dmin_b, zero_dmin, 0, CMD_DEFAULTS[1] as u32, G_MINDMIN],
             )?,
             "createAlgData",
         )?;
@@ -839,7 +840,7 @@ impl Kcdfs {
                     G_CALC_DENS_B,
                     1,
                     mat_buf,
-                    dmin_b,
+                    mat_buf,
                     0,
                     dens,
                     dens + 2,
@@ -1144,6 +1145,31 @@ pub fn roll_balance(
     roll_balance_against(dll, dir, frames, None, dmin, do_scp_pass)
 }
 
+/// Estimate roll film-base Dmin (12-bit RPD) from the roll's analysis
+/// thumbnails when no leader Dmin was measured (e.g. pre-cropped TLX `.raw`
+/// folders). Per channel, takes the 0.5th percentile across all roll frames,
+/// which tracks the unexposed film base without being pulled down by isolated
+/// dead pixels.
+fn estimate_roll_dmin(frames: &[Array3<i16>]) -> [i16; 3] {
+    if frames.is_empty() {
+        return [0, 0, 0];
+    }
+    let mut out = [0i16; 3];
+    for (c, slot) in out.iter_mut().enumerate() {
+        let mut vals: Vec<i16> = Vec::with_capacity(frames.len() * frames[0].dim().0 * frames[0].dim().1);
+        for im in frames {
+            vals.extend(im.index_axis(Axis(2), c).iter().copied());
+        }
+        if vals.is_empty() {
+            continue;
+        }
+        let idx = vals.len() / 200; // 0.5th percentile
+        vals.select_nth_unstable(idx);
+        *slot = vals[idx].clamp(0, 4095);
+    }
+    out
+}
+
 /// Like [`roll_balance`], balancing `frames` against a separate `roll` slice
 /// when rendering a single-frame preview.
 pub fn roll_balance_against(
@@ -1154,7 +1180,10 @@ pub fn roll_balance_against(
     dmin: Option<[i64; 3]>,
     do_scp_pass: bool,
 ) -> Result<KcdfsRollResult, String> {
-    let dmin_i16 = dmin.map(|d| d.map(|v| v.clamp(0, 4095) as i16)).unwrap_or([0, 0, 0]);
+    let dmin_i16 = match dmin {
+        Some(d) => d.map(|v| v.clamp(0, 4095) as i16),
+        None => estimate_roll_dmin(roll.filter(|r| !r.is_empty()).unwrap_or(frames)),
+    };
     let mut k = Kcdfs::new(dll, dir, [0, 0, 0])?;
     k.balance_frames(frames, roll, dmin_i16, do_scp_pass, false)
 }

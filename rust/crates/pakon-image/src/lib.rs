@@ -20,6 +20,7 @@ pub mod ice;
 pub mod ribbon;
 pub mod slide;
 pub mod stats;
+pub mod tlx;
 
 /// Dark level the light calibration targets (`pakon_image._RAW_BLACK`).
 pub const RAW_BLACK: f32 = 300.0;
