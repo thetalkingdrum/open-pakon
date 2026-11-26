@@ -32,6 +32,11 @@ fn main() {
         })
         .collect();
     let (out, g) = psi24::render(&rpd, gm);
+    if let Ok(path) = std::env::var("PROBE_OUT") { // planar 8-bit RGB like the .rgb files
+        let mut o = vec![0u8; 3 * w * h];
+        for y in 0..h { for x in 0..w { for c in 0..3 { o[c * w * h + y * w + x] = ((out[(y, x, c)] as u32 + 128) / 257) as u8; } } }
+        std::fs::write(path, o).unwrap();
+    }
     let mut mae = [0f64; 3];
     let mut bias = [0f64; 3];
     for y in 0..h {

@@ -393,7 +393,70 @@ impl ZipThree for (&mut Vec<u16>, &mut Vec<u16>, &mut Vec<u16>) {
 pub fn enhanced_black_printing(img: &mut Planes, gamma: Gamma) -> (GainInfo, f64) {
     let gi = gain_and_offset(img);
     let g = gamma_correction(img, gi.p, gamma);
+    if plain8() && std::env::var("PSI24_NO_BP").is_err() {
+        black_print(img);
+    }
     (gi, g)
+}
+
+// ImaEBPBlackPrintOp<uchar> defaults (EBP_FINDINGS.md section 3).
+const BP_LUMA: f64 = 0.5;
+const BP_CHROMA: f64 = 0.25;
+const BP_LUMA_MAX: f64 = 50.0;
+const BP_CHROMA_MAX: f64 = 20.0;
+const BP_RATIO: f64 = 0.4;
+
+/// Black Print on 8-bit data held as `v8 << 4`: in pixels darker than a
+/// threshold (about a third of the mean) the colour blends to a 3x3-blurred,
+/// and where the local chroma energy is small to a grey, version. The mean `M`
+/// is taken over all samples of the image (which samples the DLL uses is not
+/// established; it runs the op in 70 strips).
+pub fn black_print(img: &mut Planes) {
+    let (w, h) = (img.w, img.h);
+    if w < 2 || h < 2 {
+        return;
+    }
+    let raw: [Vec<i32>; 3] = std::array::from_fn(|c| img.p[c].iter().map(|&v| ((v as i32 + 8) >> 4).min(255)).collect());
+    let m: f64 = raw.iter().map(|p| p.iter().map(|&v| v as i64).sum::<i64>()).sum::<i64>() as f64 / (3 * w * h) as f64;
+    let lt = ((m * BP_LUMA) as i32).clamp(1, BP_LUMA_MAX as i32) as f64;
+    let ct = ((m * BP_CHROMA) as i32).clamp(1, BP_CHROMA_MAX as i32) as f64;
+    let lut1: Vec<i32> = (0..256).map(|v| (((lt - v as f64) * 4096.0 / (lt * BP_RATIO) + 0.5).floor() as i32).clamp(0, 4096)).collect();
+    let n2 = (255.0 * 1.5) as usize + 1;
+    let lut2: Vec<i32> = (0..n2).map(|v| (((ct - v as f64) * 4096.0 / (ct * BP_RATIO) + 0.5).floor() as i32).clamp(0, 4096)).collect();
+    // 3x3 blur [1 1 1; 1 8 1; 1 1 1] / 16, edges replicated.
+    let blur: [Vec<i32>; 3] = std::array::from_fn(|c| {
+        let p = &raw[c];
+        let mut o = vec![0i32; w * h];
+        o.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            let (ya, yb) = (y.saturating_sub(1), (y + 1).min(h - 1));
+            for x in 0..w {
+                let (xa, xb) = (x.saturating_sub(1), (x + 1).min(w - 1));
+                let s = p[ya * w + xa] + p[ya * w + x] + p[ya * w + xb] + p[y * w + xa] + p[y * w + xb] + p[yb * w + xa] + p[yb * w + x] + p[yb * w + xb];
+                row[x] = (s + 8 * p[y * w + x] + 8) >> 4;
+            }
+        });
+        o
+    });
+    let [pr, pg, pb] = &mut img.p;
+    pr.par_chunks_mut(w).zip(pg.par_chunks_mut(w)).zip(pb.par_chunks_mut(w)).enumerate().for_each(|(y, ((r, g), b))| {
+        for x in 0..w {
+            let i = y * w + x;
+            let l = (blur[0][i] + blur[1][i] + blur[2][i]) / 3;
+            let wgt = lut1[l.clamp(0, 255) as usize];
+            if wgt == 0 {
+                continue;
+            }
+            let e: i32 = (0..3).map(|c| (l - raw[c][i]).abs()).sum();
+            let q = lut2[(e as usize).min(n2 - 1)];
+            let i13 = ((4096 - q) * wgt + 0x800) >> 12;
+            let s2 = (((q * l + 0x800) >> 12) * wgt + 0x800) >> 12;
+            let dst = [&mut r[x], &mut g[x], &mut b[x]];
+            for (c, d) in dst.into_iter().enumerate() {
+                let o = ((raw[c][i] * (4096 - wgt) + 0x800) >> 12) + s2 + ((blur[c][i] * i13 + 0x800) >> 12);
+                *d = (o.clamp(0, 255) as u16) << 4;
+            }
+        }
+    });
 }
 
 #[cfg(test)]
