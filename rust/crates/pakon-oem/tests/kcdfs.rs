@@ -78,3 +78,43 @@ fn kcdfs_loads_and_balances_synthetic_roll() {
     let single = pakon_oem::kcdfs::roll_balance_against(&dll, &dir, &frames[2..3], Some(&frames), dmin, true).unwrap();
     assert_eq!(single.shifts[0], res_scp.shifts[2], "single-frame balance_against should match full roll");
 }
+
+/// Ground truth from the real PSI 2.4 `PakonIMAu.dll` (PIKcdfsChainLoop(do_scp=1, pref_flag=0),
+/// four 128x192 landscape thumbnails, dmin 467/804/1125, mindmin 162/401/607).
+/// Regression: bStep1 must write the frame dmin through the pointer at setup_rec+4
+/// (`*DAT_1030bf84`), otherwise every shift comes out ~+35..+60 too high.
+#[test]
+fn kcdfs_matches_real_dll_shifts() {
+    use pakon_oem::kcdfs::Kcdfs;
+
+    let root = repo();
+    let dll = default_dll(&root);
+    if !dll.is_file() {
+        eprintln!("skipped: no {}", dll.display());
+        return;
+    }
+    let data = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/psi24_ref_a");
+    let (h, w) = (128usize, 192usize);
+    let frames: Vec<Array3<i16>> = (1..=4)
+        .map(|i| {
+            let b = std::fs::read(data.join(format!("thumb{i:02}.raw"))).unwrap();
+            let v: Vec<i16> = b.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as i16).collect();
+            Array3::from_shape_fn((h, w, 3), |(y, x, c)| v[c * h * w + y * w + x])
+        })
+        .collect();
+    let want: Vec<i32> = std::fs::read(data.join("shifts_i32.bin"))
+        .unwrap()
+        .chunks(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let mut k = Kcdfs::new(&dll, &kcdfs_dir(&root), [162, 401, 607]).expect("Kcdfs::new");
+    let res = k.balance_roll(&frames, [467, 804, 1125], true, false).expect("balance_roll");
+    assert_eq!(res.shifts.len(), 4);
+    for (f, s) in res.shifts.iter().enumerate() {
+        for c in 0..3 {
+            let d = (s[c] as i32 - want[f * 3 + c]).abs();
+            assert!(d <= 2, "frame {f} ch {c}: ours {} real {}", s[c], want[f * 3 + c]);
+        }
+    }
+}

@@ -806,6 +806,12 @@ impl Kcdfs {
         let geom: [u32; 11] = [rows as u32, cols as u32, 99999, 99999, 99999, 99999, 24, 36, 99999, 0x360, 0];
         e.write(G_GEOMETRY, &le_u32s(&geom))?;
         e.write(G_SETUP_REC + 0x0C, &0u32.to_le_bytes())?;
+        // bStep1 does `*DAT_1030bf84 = dmin`: the pointer at setup_rec+4 is the buffer
+        // SbuReadSetupFile allocated (it overwrites the constructor's &G_DMIN_BUF), so the
+        // frame's dmin must go through it. Writing only G_DMIN_BUF left the file's 0,0,0 in
+        // place and lifted every shift by ~+35..+60 (equal on R,G,B).
+        let dmin_ptr = e.u32(G_SETUP_REC + 4);
+        e.write(dmin_ptr, &le_i16s(&dmin))?;
         e.write(G_DMIN_BUF, &le_i16s(&dmin))?;
 
         let dmin_a = e.alloc(8, Some(&le_i16s(&dmin)))?;
