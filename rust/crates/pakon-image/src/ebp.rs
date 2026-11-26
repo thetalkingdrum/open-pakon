@@ -99,6 +99,35 @@ fn binom3(src: &[i32], w: usize, h: usize) -> Vec<i32> {
     out
 }
 
+/// The 8-bit instance's blurs: horizontal pass then vertical pass, each divided
+/// by its weight sum with truncation (`>> 4` for [1 4 6 4 1], `>> 2` for
+/// [1 2 1]); reproduces the DLL's dumped histograms bit for bit. Returns 8-bit values.
+fn blur_floor(src: &[i32], w: usize, h: usize, k: &[i32], shift: u32) -> Vec<i32> {
+    let r = k.len() / 2;
+    let mut tmp = vec![0i32; w * h];
+    tmp.par_chunks_mut(w).enumerate().for_each(|(y, out)| {
+        let row = &src[y * w..(y + 1) * w];
+        for x in 0..w {
+            let mut s = 0;
+            for (i, wt) in k.iter().enumerate() {
+                s += wt * row[(x + i).saturating_sub(r).min(w - 1)];
+            }
+            out[x] = s >> shift;
+        }
+    });
+    let mut out = vec![0i32; w * h];
+    out.par_chunks_mut(w).enumerate().for_each(|(y, o)| {
+        for x in 0..w {
+            let mut s = 0;
+            for (i, wt) in k.iter().enumerate() {
+                s += wt * tmp[((y + i).saturating_sub(r)).min(h - 1) * w + x];
+            }
+            o[x] = s >> shift;
+        }
+    });
+    out
+}
+
 /// Result of [`gain_and_offset`].
 #[derive(Debug, Clone, Copy)]
 pub struct GainInfo {
@@ -127,8 +156,14 @@ pub fn gain_and_offset(img: &mut Planes) -> GainInfo {
     let mut hist = [[0u64; 256]; 3];
     for c in 0..3 {
         let x8: Vec<i32> = img.p[c].iter().map(|&v| (v >> 4) as i32).collect();
-        for s in binom5(&x8, w, h) {
-            hist[c][(s >> 8).clamp(0, 255) as usize] += 1;
+        if plain8() {
+            for v in blur_floor(&x8, w, h, &[1, 4, 6, 4, 1], 4) {
+                hist[c][v.clamp(0, 255) as usize] += 1;
+            }
+        } else {
+            for s in binom5(&x8, w, h) {
+                hist[c][(s >> 8).clamp(0, 255) as usize] += 1;
+            }
         }
     }
     let nb = (n as f64 * black_pct() * 0.01 + 0.5) as u64;
@@ -172,9 +207,8 @@ pub fn gain_and_offset(img: &mut Planes) -> GainInfo {
     if t < lo[1] && valid[1] {
         lo[1] = t;
     }
-    // A channel whose percentile range is under 4 levels counts as empty (range 0, which
-    // makes the whole stage the identity). Probe data: P3a_2000_3000, P3b s200 vs s500.
-    let r: [i32; 3] = std::array::from_fn(|c| if hi[c] - lo[c] < 4 { 0 } else { hi[c] - lo[c] });
+    // A channel with no range (hi <= lo) counts as empty: range 0 makes the whole stage the identity.
+    let r: [i32; 3] = std::array::from_fn(|c| if hi[c] <= lo[c] { 0 } else { hi[c] - lo[c] });
     let tot: i32 = r.iter().sum();
     let gain_avg = if tot > 0 { 3.0 * 255.0 / tot as f64 } else { 1.0 };
     let minr = *r.iter().min().unwrap();
@@ -212,7 +246,7 @@ pub fn gain_and_offset(img: &mut Planes) -> GainInfo {
     let hi2 = u as i32;
     let mut k1 = 1.0;
     let mut luts: [Vec<u16>; 3] = Default::default();
-    let stage1_only = (lo2 <= SHADOW_THR && HIGHLIGHT_THR <= hi2) || (hi2 as f64) < lo2 as f64 + 63.75;
+    let stage1_only = if std::env::var("EBP_OR").is_ok() { lo2 <= SHADOW_THR || HIGHLIGHT_THR <= hi2 } else { lo2 <= SHADOW_THR && HIGHLIGHT_THR <= hi2 } || (hi2 as f64) < lo2 as f64 + 63.75;
     if stage1_only {
         for c in 0..3 {
             luts[c] = (0..=MAXV).map(|x| ((x as f64 - (off[c] << 4) as f64) * s[c]).floor().clamp(0.0, MAXV as f64) as u16).collect();
@@ -282,10 +316,10 @@ pub fn estimate_gamma(img: &Planes) -> GammaEstimate {
     let t_lo = (mean_lo_pct() * 2.56).ceil();
     let t_hi = (mean_hi_pct() * 2.56).ceil();
     let l8: Vec<i32> = (0..n).map(|i| (((img.p[0][i] as i32 + img.p[1][i] as i32 + img.p[2][i] as i32) + 1) / 3) >> 4).collect();
-    let s5 = binom5(&l8, w, h);
+    let (s5, s5_scale) = if plain8() { (blur_floor(&l8, w, h, &[1, 4, 6, 4, 1], 4), 1.0) } else { (binom5(&l8, w, h), 256.0) };
     let mut hist = [0i64; 256];
     for &s in &s5 {
-        hist[((s + 128) >> 8).clamp(0, 255) as usize] += 1;
+        hist[if plain8() { s } else { (s + 128) >> 8 }.clamp(0, 255) as usize] += 1;
     }
     let (mut i, mut seen, mut cnt_lo, mut sum_lo) = (0usize, 0, 0i64, 0i64);
     while i < 255 && seen < 2 {
@@ -320,8 +354,8 @@ pub fn estimate_gamma(img: &Planes) -> GammaEstimate {
         let mean = (tot - sum_lo - sum_hi) as f64 / inner.max(1) as f64;
         let mut g1 = 1.0;
         if mean >= t_lo {
-            let s3 = binom3(&l8, w, h);
-            let d = |i: usize| s3[i] as f64 / 16.0 - s5[i] as f64 / 256.0;
+            let (s3, s3_scale) = if plain8() { (blur_floor(&l8, w, h, &[1, 2, 1], 2), 1.0) } else { (binom3(&l8, w, h), 16.0) };
+            let d = |i: usize| s3[i] as f64 / s3_scale - s5[i] as f64 / s5_scale;
             let ss: f64 = (0..n).into_par_iter().map(|i| d(i) * d(i)).sum();
             let sig = (ss / (n.max(2) - 1) as f64).sqrt();
             let thr = (sig * EDGE_THR).trunc();
@@ -368,6 +402,32 @@ pub fn gamma_correction(img: &mut Planes, p: f64, mode: Gamma) -> f64 {
             (((slope - 1.0) * citras() + 1.0) * (1.0 / p) * 4096.0 + 0.5).floor() as i32
         })
         .collect();
+    if plain8() {
+        // 8-bit instance: 256-entry tables, chroma term truncated toward zero (checked
+        // against the real stage dumps: 92 % of samples exact, the rest within 1).
+        const M8: i32 = 255;
+        let lut8: Vec<i32> = (0..=M8).map(|i| ((M8 as f64 * (i as f64 / M8 as f64).powf(g) + 0.5).floor() as i32).clamp(0, M8)).collect();
+        let gain8: Vec<i32> = (0..=M8)
+            .map(|i| {
+                let t = i as f64 / (M8 as f64 * p);
+                let mut slope = t.powf(g - 1.0) * p.powf(g) * g;
+                if !slope.is_finite() {
+                    slope = 1.0;
+                }
+                (((slope - 1.0) * citras() + 1.0) * (1.0 / p) * 4096.0 + 0.5).floor() as i32
+            })
+            .collect();
+        let [pr, pg, pb] = &mut img.p;
+        (pr, pg, pb).into_par_iter_zip(|r, g_, b| {
+            let (r8, g8, b8) = ((*r >> 4) as i32, (*g_ >> 4) as i32, (*b >> 4) as i32);
+            let l = ((r8 + g8 + b8) + 1) / 3;
+            let (ln, gk) = (lut8[l as usize], gain8[l as usize]);
+            for (v, c) in [(r, r8), (g_, g8), (b, b8)] {
+                *v = ((ln + ((c - l) * gk) / 4096).clamp(0, M8) as u16) << 4;
+            }
+        });
+        return g;
+    }
     let [pr, pg, pb] = &mut img.p;
     (pr, pg, pb).into_par_iter_zip(|r, g_, b| {
         let l = ((*r as i32 + *g_ as i32 + *b as i32) * 2 + 3) / 6;
@@ -393,10 +453,102 @@ impl ZipThree for (&mut Vec<u16>, &mut Vec<u16>, &mut Vec<u16>) {
 pub fn enhanced_black_printing(img: &mut Planes, gamma: Gamma) -> (GainInfo, f64) {
     let gi = gain_and_offset(img);
     let g = gamma_correction(img, gi.p, gamma);
+    if plain8() && std::env::var("PSI24_NO_NF").is_err() {
+        noise_filter(img);
+    }
     if plain8() && std::env::var("PSI24_NO_BP").is_err() {
         black_print(img);
     }
     (gi, g)
+}
+
+
+// ImaEBPNoiseFilterOp<uchar> is not decoded. What the real stage dumps (psi24-ebp-stages) show:
+// every channel is smoothed with a 3x3 box, and the luma high-pass (Y - box(Y), Y = mean of
+// RGB) is cored: small detail is scaled down to about half, detail beyond ~15 levels passes
+// through. `NF_*` is the measured mean of (real - box(channel)) against the luma high-pass,
+// pooled over frames 1 and 4 (hp = -24..24, per channel because the stage also carries a small
+// per-channel bias). Fits the real output to MAE 0.7-1.1 (no stage: 2.4-3.4).
+const NF_R: [f32; 49] = [-16.94, -15.90, -14.49, -13.44, -11.84, -11.17, -9.77, -8.98, -7.87, -6.91, -6.25, -5.23, -4.81, -3.97, -3.58, -2.93, -2.50, -2.06, -1.48, -1.23, -0.59, -0.42, 0.15, 0.39, 0.85, 1.32, 1.78, 2.43, 2.73, 3.43, 3.70, 4.38, 4.79, 5.44, 6.19, 6.76, 7.95, 8.74, 10.24, 11.22, 12.88, 14.11, 15.34, 17.15, 18.10, 20.27, 20.97, 23.04, 24.38];
+const NF_G: [f32; 49] = [-18.99, -17.96, -16.52, -15.57, -14.05, -13.39, -12.17, -11.36, -10.31, -9.46, -8.93, -8.04, -7.71, -6.98, -6.73, -6.16, -5.78, -5.38, -4.82, -4.55, -3.85, -3.55, -2.80, -2.39, -1.81, -1.46, -1.20, -0.71, -0.50, 0.14, 0.38, 1.04, 1.45, 2.07, 2.80, 3.36, 4.50, 5.12, 6.61, 7.54, 9.12, 10.30, 11.49, 13.27, 14.18, 16.28, 17.08, 18.96, 20.13];
+const NF_B: [f32; 49] = [-20.57, -19.42, -18.02, -17.00, -15.35, -14.66, -13.28, -12.31, -11.07, -10.01, -9.21, -8.16, -7.60, -6.68, -6.25, -5.56, -5.11, -4.66, -4.09, -3.84, -3.21, -3.02, -2.43, -2.18, -1.71, -1.30, -0.92, -0.33, -0.08, 0.58, 0.82, 1.50, 1.88, 2.52, 3.28, 3.88, 5.10, 5.85, 7.39, 8.49, 10.14, 11.38, 12.66, 14.42, 15.40, 17.53, 18.29, 20.22, 21.35];
+
+pub fn noise_filter(img: &mut Planes) {
+    let (w, h) = (img.w, img.h);
+    if w < 2 || h < 2 {
+        return;
+    }
+    let raw: [Vec<i32>; 3] = std::array::from_fn(|c| img.p[c].iter().map(|&v| ((v as i32 + 8) >> 4).min(255)).collect());
+    let boxed: [Vec<f32>; 3] = std::array::from_fn(|c| {
+        let p = &raw[c];
+        let mut o = vec![0f32; w * h];
+        o.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            let (ya, yb) = (y.saturating_sub(1), (y + 1).min(h - 1));
+            for x in 0..w {
+                let (xa, xb) = (x.saturating_sub(1), (x + 1).min(w - 1));
+                let s = p[ya * w + xa] + p[ya * w + x] + p[ya * w + xb] + p[y * w + xa] + p[y * w + x] + p[y * w + xb] + p[yb * w + xa] + p[yb * w + x] + p[yb * w + xb];
+                row[x] = s as f32 / 9.0;
+            }
+        });
+        o
+    });
+    let tabs: [&[f32; 49]; 3] = [&NF_R, &NF_G, &NF_B];
+    let f = |c: usize, hp: f32| -> f32 {
+        let t = tabs[c];
+        let x = hp + 24.0;
+        if x <= 0.0 {
+            t[0] + x
+        } else if x >= 48.0 {
+            t[48] + (x - 48.0)
+        } else {
+            let i = x as usize;
+            let fr = x - i as f32;
+            t[i] * (1.0 - fr) + t[i + 1] * fr
+        }
+    };
+    // Luma high-pass and its local activity (5x5 mean of |hp|).
+    let hp: Vec<f32> = (0..w * h).map(|i| (raw[0][i] + raw[1][i] + raw[2][i]) as f32 / 3.0 - (boxed[0][i] + boxed[1][i] + boxed[2][i]) / 3.0).collect();
+    let ahp: Vec<f32> = hp.iter().map(|v| v.abs()).collect();
+    let act: Vec<f32> = {
+        let mut tmp = vec![0f32; w * h];
+        tmp.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            for x in 0..w {
+                let mut s = 0.0;
+                for k in 0..5 {
+                    s += ahp[y * w + (x + k).saturating_sub(2).min(w - 1)];
+                }
+                row[x] = s / 5.0;
+            }
+        });
+        let mut o = vec![0f32; w * h];
+        o.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            for x in 0..w {
+                let mut s = 0.0;
+                for k in 0..5 {
+                    s += tmp[(y + k).saturating_sub(2).min(h - 1) * w + x];
+                }
+                row[x] = s / 5.0;
+            }
+        });
+        o
+    };
+    let [pr, pg, pb] = &mut img.p;
+    pr.par_chunks_mut(w).zip(pg.par_chunks_mut(w)).zip(pb.par_chunks_mut(w)).enumerate().for_each(|(y, ((r, g), b))| {
+        for x in 0..w {
+            let i = y * w + x;
+            let hpv = hp[i];
+            // The tables carry a per-channel offset that the real stage only shows on textured
+            // content (flat probe patches pass unchanged): odd part always, even part with the
+            // local activity.
+            let wt = (act[i] / 0.3).min(1.0);
+            let dst = [&mut r[x], &mut g[x], &mut b[x]];
+            for (c, d) in dst.into_iter().enumerate() {
+                let (fp, fm) = (f(c, hpv), f(c, -hpv));
+                let delta = 0.5 * (fp - fm) + wt * 0.5 * (fp + fm);
+                *d = ((boxed[c][i] + delta + 0.5).floor().clamp(0.0, 255.0) as u16) << 4;
+            }
+        }
+    });
 }
 
 // ImaEBPBlackPrintOp<uchar> defaults (EBP_FINDINGS.md section 3).

@@ -60,16 +60,27 @@ pub fn render(rpd: &[Vec<f32>], gamma: Gamma) -> (Array3<u16>, f64) {
     // `PSI24_ROMM12=1` keeps the old 12-bit ROMM path for comparisons.
     let e8 = std::env::var("PSI24_ROMM12").is_err();
     ebp::set_plain8(e8);
+    let corr = std::env::var("PSI24_NO_PRECORR").is_err();
     if e8 && w > 0 {
         let [pr, pg, pb] = &mut pl.p;
         pr.par_chunks_mut(w).zip(pg.par_chunks_mut(w)).zip(pb.par_chunks_mut(w)).for_each(|((r, g), b)| {
             for x in 0..w {
                 let s = t.romm_srgb.lookup([r[x] as f32 / 4095.0, g[x] as f32 / 4095.0, b[x] as f32 / 4095.0]);
-                r[x] = ((s[0] * 255.0 + 0.5) as u16).min(255) << 4;
-                g[x] = ((s[1] * 255.0 + 0.5) as u16).min(255) << 4;
-                b[x] = ((s[2] * 255.0 + 0.5) as u16).min(255) << 4;
+                let (r8, g8, b8) = (s[0] * 255.0, s[1] * 255.0, s[2] * 255.0);
+                let k = if corr { 1.0 } else { 0.0 };
+                r[x] = ((r8 + k * pre_corr(r8, &PRE_R, false) + 0.5).clamp(0.0, 255.0) as u16) << 4;
+                g[x] = ((g8 + k * pre_corr(g8, &PRE_G, true) + 0.5).clamp(0.0, 255.0) as u16) << 4;
+                b[x] = ((b8 + k * pre_corr(b8, &PRE_B, true) + 0.5).clamp(0.0, 255.0) as u16) << 4;
             }
         });
+    }
+    if let (Ok(path), true) = (std::env::var("PSI24_DUMP_PRE"), e8) {
+        // planar 8-bit sRGB entering EBP (for comparing with the real stage dumps)
+        let mut o = Vec::with_capacity(3 * w * h);
+        for c in 0..3 {
+            o.extend(pl.p[c].iter().map(|&v| (v >> 4) as u8));
+        }
+        std::fs::write(path, o).unwrap();
     }
     let used = if w > 0 { ebp::enhanced_black_printing(&mut pl, gamma).1 } else { 1.0 };
     let mut out = Array3::<u16>::zeros((h, w, 3));
@@ -89,6 +100,25 @@ pub fn render(rpd: &[Vec<f32>], gamma: Gamma) -> (Array3<u16>, f64) {
         }
     });
     (out, used)
+}
+
+
+/// Measured difference (real - ours) of the 8-bit sRGB entering EBP, at knots 0, 16, .. 240 per
+/// channel, pooled over the two real frames of `psi24-ebp-stages` (frame 1 alone predicts frame 4's
+/// error: MAE 2.0 -> 0.8). Our `rpd.pf -> romm.pf -> srgb.pf` tables are about 2-4 levels low in the
+/// highlights and 1-3 high in the shadows against the DLL; the cause is not found, this is the fit.
+const PRE_R: [f32; 16] = [2.12, 1.86, 1.29, 1.01, 1.39, 1.75, 1.96, 2.22, 2.41, 3.04, 3.74, 3.83, 3.77, 3.92, 4.09, 4.18];
+const PRE_G: [f32; 16] = [-0.39, -0.50, -0.76, -0.91, -0.50, 0.06, 0.30, 0.67, 1.08, 1.40, 1.86, 2.18, 2.42, 2.70, 2.74, 2.55];
+const PRE_B: [f32; 16] = [-1.59, -1.67, -1.67, -1.46, -1.09, -0.76, -0.48, 0.07, 0.42, 0.69, 1.29, 1.57, 1.67, 1.98, 2.10, 2.02];
+
+fn pre_corr(v: f32, k: &[f32; 16], fade: bool) -> f32 {
+    let x = (v / 16.0).clamp(0.0, 15.0);
+    let i = (x as usize).min(14);
+    let f = x - i as f32;
+    // G and B fade out over the last 7 levels: the DLL leaves them just under 255 where the red
+    // is already clipped, and pushing them into the clipped bin flips the white-point branch of
+    // Gain & Offset (probe P3b_c1800_s1000).
+    (k[i] * (1.0 - f) + k[i + 1] * f) * if fade { ((255.0 - v) / 7.0).clamp(0.0, 1.0) } else { 1.0 }
 }
 
 #[inline]
