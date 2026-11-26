@@ -106,3 +106,26 @@ Called from `0x10027e75` and `0x10028606`, receiving `roll_obj + 0xca8` (`scp_lu
 - **Result:** Gain and Offset (per-channel auto-levels, ~0.1 % clip, about 1.14x gain, black point 27 -> 0) is the missing contrast and toe. On a display-referred 12-bit signal it cuts MAE vs real from 15.3 to 5.9, and with Gamma (gamma ~0.95) to about 5.1. EBP on the RPD domain is wrong (crushes the image).
 - **Still open:** the warm cast (it is upstream of EBP, tone-dependent, in SCP/shift/table), the real shifts, the exact RPD -> 12-bit ROMM conversion, and the Noise Filter code.
 - **Details and scripts:** `~/pakon-re/psi24-ghidra/` (`EBP_FINDINGS.md`, `EBP_VALIDATION.md`, `ebp_sketch.py`, Ghidra project and decompiles).
+
+
+---
+
+## 5. EBP chain, bit-level findings (validated against the real DLL)
+
+Validated with a Windows host that runs the real `PakonIMAu.dll` offline (hooks, whole-image stage dumps, synthetic probes). Code: `rust/crates/pakon-image/src/ebp.rs`, `psi24.rs`; examples `psi24_probe`, `psi24_stage`, `psi24_curve`, `psi24_pt`.
+
+**Domain.** The C-41 EBP runs on **8-bit planar sRGB** (after rpd -> romm -> srgb), using the `uchar` ("E") template instances. The 12-bit "G" instances (`0x10183e40`, `0x10180dc0`) are never called. Plain 8-bit defaults: black 0.10 %, white 0.15 %, shadow/highlight 0.06 (thresholds 5/250), Gamma meanLow 39.06, meanHigh 48.82, citras 0.5; Black Print luma 0.5, chroma 0.25, luma max 50, chroma max 20, ratio 0.4. Order: Gain&Offset -> Gamma -> Noise Filter -> Black Print.
+
+**Gain & Offset.** Histogram is the image blurred with horizontal then vertical `[1 4 6 4 1]`, each pass `>>4` (truncating): bit-exact against dumped histograms. Percentiles give lo/hi; `whiteOffsetMethod=1` with the bVar2 branch (hi_R > avg -> `((hi_c+hi_R)/2+255)/2`) and the knee apply. A channel is empty only when `hi <= lo`. The double at struct `+0x60` is the average gain (765/sum r); the Gamma-builder `+0x10` double is k1 x that gain. Ours is 98.6 % / 99.9 % exact on the real s0.
+
+**Gamma.** 8-bit tables: `lutL[i] = floor(255*(i/255)^g + 0.5)` and `gainL` (Q12). Per pixel: `L=(R+G+B+1)/3`, `c' = lutL[L] + trunc_toward_zero((c-L)*gainL[L]/4096)` (92 % exact against the real tables). The estimator uses 8-bit floor blurs (`>>4` for the 5-tap, `>>2` for the 3-tap) and lands within about 0.01 of the DLL's gamma. It is a histogram statistic, not spatial.
+
+**Black Print.** 3x3 `[1 1 1;1 8 1;1 1 1]/16` blur, M = mean over all samples, lut1/lut2 in Q12. Matches the real stage 99.1 % / 95.8 % exact.
+
+**Noise Filter (`ImaEBPNoiseFilterOp<uchar>`, `0x1016c830`, vtable `0x10284a04`; coring 20, boost 2.0, size 10).** Active, **not decoded**. Ours is an empirical model: per channel `out = box3(c) + F_c(hp)` with `hp = Y - box3(Y)`, Y=(R+G+B)/3, F_c fitted tables (49 entries, hp -24..24); the offset part is weighted by min(1, activity/0.3). This stage is what cuts chroma, so skipping it oversaturates.
+
+**Pre-EBP conversion.** Our `rpd -> romm -> srgb` tables are 2-4 levels low in highlights and 1-3 high in shadows versus the DLL's s0. A fitted per-channel 1D correction is applied (G/B fade over the last 7 levels so the bVar2 branch does not flip). Root cause not found.
+
+**Results vs the DLL with real shifts (same input).** Frame 1 MAE 1.0, frame 2 1.2, frame 3 1.3, frame 4 1.5 (variant A); frame 2 variant B 2.5. Probe suite mean MAE 1.6 (was 12-23). Whole EBP from the real s0: MAE 0.8-0.9.
+
+**Open.** Decode the real Noise Filter; find the table difference behind the pre-EBP correction (currently fitted on one film); probe `P3a_1500_3000` M4 (MAE 9); frame 2 variant B bias.
