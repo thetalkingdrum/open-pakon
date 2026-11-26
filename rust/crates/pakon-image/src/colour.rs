@@ -106,6 +106,14 @@ impl Table {
         Ok(Table { n, data: bytes.iter().map(|&b| b as f32 / 255.0f32).collect() })
     }
 
+    /// From a 16-bit little-endian grid (R-major, `n`^3 x 3 samples), /65535.
+    pub fn from_u16_le(n: usize, bytes: &[u8]) -> Result<Table, String> {
+        if bytes.len() != n * n * n * 3 * 2 {
+            return Err(format!("table: {} bytes, want {}", bytes.len(), n * n * n * 6));
+        }
+        Ok(Table { n, data: bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]]) as f32 / 65535.0f32).collect() })
+    }
+
     /// Trilinear lookup of one value in [0, 1] (`_interp3`): weights in f64,
     /// as numpy promotes `f32 - int32`; the result rounds to f32.
     #[inline]
@@ -309,22 +317,7 @@ pub fn render_oem_scp(
         let v = &rpd[y];
         let sharpened;
         let v: &[f32] = if sharp != 0.0 {
-            // _unsharp: x + amount * (x - blur), blur the separable
-            // [1/4, 1/2, 1/4] kernel (rows first), edges repeated.
-            let up = &rpd[y.saturating_sub(1)];
-            let dn = &rpd[(y + 1).min(h - 1)];
-            let rows: Vec<f32> = (0..3 * w).map(|k| 0.25f32 * up[k] + 0.5f32 * v[k] + 0.25f32 * dn[k]).collect();
-            sharpened = (0..w)
-                .flat_map(|x| {
-                    let (xl, xr) = (x.saturating_sub(1), (x + 1).min(w - 1));
-                    let rows = &rows;
-                    (0..3).map(move |c| {
-                        let blur = 0.25f32 * rows[3 * xl + c] + 0.5f32 * rows[3 * x + c] + 0.25f32 * rows[3 * xr + c];
-                        let s = v[3 * x + c];
-                        (s + sharp * (s - blur)).clamp(0.0, 4095.0)
-                    })
-                })
-                .collect::<Vec<f32>>();
+            sharpened = unsharp_row(&rpd, y, sharp);
             &sharpened
         } else {
             v
@@ -342,6 +335,62 @@ pub fn render_oem_scp(
         }
     });
     out
+}
+
+/// Row `y` of the RPD field with the unsharp mask (`_unsharp`: x + amount *
+/// (x - blur), blur the separable [1/4, 1/2, 1/4] kernel (rows first), edges
+/// repeated), clamped to 12 bits.
+fn unsharp_row(rpd: &[Vec<f32>], y: usize, sharp: f32) -> Vec<f32> {
+    let h = rpd.len();
+    let w = rpd[0].len() / 3;
+    let v = &rpd[y];
+    let up = &rpd[y.saturating_sub(1)];
+    let dn = &rpd[(y + 1).min(h - 1)];
+    let rows: Vec<f32> = (0..3 * w).map(|k| 0.25f32 * up[k] + 0.5f32 * v[k] + 0.25f32 * dn[k]).collect();
+    (0..w)
+        .flat_map(|x| {
+            let (xl, xr) = (x.saturating_sub(1), (x + 1).min(w - 1));
+            let rows = &rows;
+            (0..3).map(move |c| {
+                let blur = 0.25f32 * rows[3 * xl + c] + 0.5f32 * rows[3 * x + c] + 0.25f32 * rows[3 * xr + c];
+                let s = v[3 * x + c];
+                (s + sharp * (s - blur)).clamp(0.0, 4095.0)
+            })
+        })
+        .collect()
+}
+
+/// The 12-bit RPD field of a negative (H, W, 3) -> interleaved f32 rows
+/// `[R G B R G B ...]`: SCP LUT, contrast, scene-balance shifts, offsets and
+/// the unsharp mask, everything [`render_oem_scp`] does before the colour
+/// table.
+pub fn rpd_field(
+    rgb: ArrayView3<u16>,
+    m: &Matrix,
+    lut: &[f32],
+    scp_luts: Option<&[[u16; 4096]; 3]>,
+    bal: Option<&Balance>,
+    adj: Option<&Adjust>,
+) -> Vec<Vec<f32>> {
+    let (h, w, _) = rgb.dim();
+    let contrast = adj.map_or(0.0, |a| a.contrast_slope());
+    let off = adj.map(|a| a.offsets());
+    let sharp = adj.map_or(0.0, |a| a.sharp());
+    let rgb = rgb.as_standard_layout();
+    let rpd_of = |y: usize| -> Vec<f32> {
+        let row = rgb.index_axis(Axis(0), y);
+        let mut v = Vec::with_capacity(3 * w);
+        for x in 0..w {
+            let p = row.index_axis(Axis(0), x);
+            v.extend(rpd_adjusted(p.as_slice().unwrap(), m, lut, contrast, scp_luts, bal, off.as_ref()));
+        }
+        v
+    };
+    let rpd: Vec<Vec<f32>> = (0..h).into_par_iter().map(rpd_of).collect();
+    if sharp == 0.0 {
+        return rpd;
+    }
+    (0..h).into_par_iter().map(|y| unsharp_row(&rpd, y, sharp)).collect()
 }
 
 /// (H, W, 3) 16-bit sRGB → (H, W) 16-bit grey, Rec. 709 luma.
