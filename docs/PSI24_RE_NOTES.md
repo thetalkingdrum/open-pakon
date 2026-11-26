@@ -63,12 +63,14 @@ Location: `~/Downloads/PAKON PSI 2.4/fx35install/program files/Pakon/F-X35 COM S
 Location: `~/Downloads/PAKON PSI 2.4/fx35install/program files/Pakon/F-X35 COM SERVER/TLB.dll` (`ImageBase 0x10000000`).
 
 ### `PakonIMAu.dll` function table (`0x10012820..0x10012914`, global ptr `[0x100743a4]`)
+_Corrected: the loader stores each `GetProcAddress` result one call after its push, so earlier slot names for `+0x38..+0x4c` were off by one. Slots `+0x2c` and `+0x50` and above were not re-checked and may be off by one too._
 - `[esi + 0x2c]` — `PIColorAdjustPlanar_8` (string `0x1005cfbc`)
-- `[esi + 0x38]` — `PIColorCorrectColNegPlanarScan` (`0x1005cf64`)
+- `[esi + 0x38]` — the `0x1005cf84` name (not identified)
+- `[esi + 0x3c]` — `PIColorCorrectColNegPlanarScan` (`0x1005cf64`)
 - `[esi + 0x40]` — `PIColorCorrectColNegPlanarSave` (`0x1005cf44`)
-- `[esi + 0x44]` — `PIColorCorrectColRevPlanar` (`0x1005cf08`)
-- `[esi + 0x48]` — `PIColorSceneBalanceColRevPlanar` (`0x1005cee8`)
-- `[esi + 0x4c]` — `PIColorSceneBalanceColNegPlanar` (`0x1005cf24`)
+- `[esi + 0x44]` — `PIColorSceneBalanceColNegPlanar` (`0x1005cf24`)
+- `[esi + 0x48]` — `PIColorCorrectColRevPlanar` (`0x1005cf08`)
+- `[esi + 0x4c]` — `PIColorSceneBalanceColRevPlanar` (`0x1005cee8`)
 - `[esi + 0x50]` — `PIKcdfsStartNewRoll` (`0x1005ced4`)
 - `[esi + 0x54]` — `PIKcdfsAddThumbNail` (`0x1005cec0`)
 - `[esi + 0x58]` — `PIKcdfsChainLoop` (`0x1005ceac`)
@@ -98,5 +100,9 @@ Called from `0x10027e75` and `0x10028606`, receiving `roll_obj + 0xca8` (`scp_lu
   - `bStep1` (`0x10001940`): `kcdfs.rs` was fixed in `afd8147` to match `createAlgData` + `_sbaCalcDens` exact stack args (`dmin_a` preserved for `_sbaCalcDens`, `mat_buf` passed as arg 8).
   - `bStep2` (`0x10001c20`): calls `SbaCalcFosResults` (`0x1022bb20`), `Sba(..., mode=2, ...)` (`0x102286c0`), and either `SbaBuildSCPLuts` (`0x1022b250`) or `Preference` (`0x1022ad90`).
   - `PIKcdfsGetShift_{R,G,B}` (`0x10001e50/80/b0`) read `i16` at `[frame + 0x39c6/c8/ca]`.
-- **Where to look next for the ~1.4× contrast + ~-150 black-point difference:**
-  - Inspect `0x10068c30` (called by `PIColorCorrectColRevPlanar` `0x10005450` and `PIColorSceneBalanceColNegPlanar` `0x10005860`) and the struct-based `0x10023d89` target in `oem/psi24/PakonIMAu.dll` to see if `PakonIMAu.dll` applies a contrast/toe curve, `lut1b.00` / `lut2p.00`, or black-point adjustment during final RPD → sRGB rendering when KCDFS is active.
+- **Correction:** `0x10068c30` is a `std::basic_string` helper, not a colour curve. The C-41 path is `PIColorSceneBalanceColNegPlanar` (`0x10005860`): `p+0x6c = (film != 1)` and C-41 takes the EnhancedBlackPrinting (EBP) branch.
+- **Pipeline there:** baked SCP LUT + shift (`FUN_10001fe0`: `out = clamp(lut[i] + shift, 0, 4095)`, same as our port) -> `ImaEBPOperation` -> contrast (`1 + p[9]/1000`, 1.0 at default sliders) -> ICC combine/colour conversion.
+- **EBP chain order:** Gain and Offset -> Gamma -> Noise Filter -> Black Print, all attributes at constructor defaults (only `padValue` is set). The `FUN_10166010` method once read as a noise filter is Black Print.
+- **Result:** Gain and Offset (per-channel auto-levels, ~0.1 % clip, about 1.14x gain, black point 27 -> 0) is the missing contrast and toe. On a display-referred 12-bit signal it cuts MAE vs real from 15.3 to 5.9, and with Gamma (gamma ~0.95) to about 5.1. EBP on the RPD domain is wrong (crushes the image).
+- **Still open:** the warm cast (it is upstream of EBP, tone-dependent, in SCP/shift/table), the real shifts, the exact RPD -> 12-bit ROMM conversion, and the Noise Filter code.
+- **Details and scripts:** `~/pakon-re/psi24-ghidra/` (`EBP_FINDINGS.md`, `EBP_VALIDATION.md`, `ebp_sketch.py`, Ghidra project and decompiles).
