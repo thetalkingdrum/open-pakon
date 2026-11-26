@@ -831,6 +831,7 @@ impl Orient {
 /// the scene balance of the roll and the per-picture tables. Shared by the
 /// export and the Adjust previews, so both render the same.
 struct Renderer {
+    engine: ColorEngine,
     grey: bool,
     base: [f32; 3],
     flare: Option<[f32; 3]>,
@@ -887,6 +888,7 @@ impl Renderer {
             }
         }
         Ok(Renderer {
+            engine,
             grey: req.film.grey(),
             base: req.base,
             flare: req.flare,
@@ -938,7 +940,16 @@ impl Renderer {
                 Some(a) if a.saturation != 0 || a.tone != Tone::None => Some(self.table_for(&o.table, &self.profiles.join(self.rpd_profile_name), a)?),
                 _ => None,
             };
-            let out = colour::render_oem_scp(part, &o.negmat, &o.lut, t.as_deref().unwrap_or(&o.table), self.scp_luts.as_deref(), bal.as_ref(), adj, grey);
+            // PSI 2.4 colour: RPD -> ROMM12 -> EnhancedBlackPrinting -> sRGB (the
+            // saturation / tone profiles act on the RPD table, so they keep the
+            // table path).
+            let ebp = self.engine == ColorEngine::Psi24 && !grey && t.is_none();
+            let out = if ebp {
+                let field = colour::rpd_field(part, &o.negmat, &o.lut, self.scp_luts.as_deref(), bal.as_ref(), adj);
+                pakon_image::psi24::render(&field, pakon_image::ebp::Gamma::Auto { cap: pakon_image::psi24::GAMMA_CAP }).0
+            } else {
+                colour::render_oem_scp(part, &o.negmat, &o.lut, t.as_deref().unwrap_or(&o.table), self.scp_luts.as_deref(), bal.as_ref(), adj, grey)
+            };
             let keep_colour = adj.is_some_and(|a| a.tone != Tone::None);
             let pos = if grey && !keep_colour { Picture16Owned::Grey(colour::to_grey(out.view())) } else { Picture16Owned::Rgb(out) };
             let r = output::to_u8(&pos.picture());
