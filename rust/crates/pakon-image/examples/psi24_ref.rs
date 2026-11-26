@@ -20,6 +20,11 @@ fn main() {
         v => Gamma::Fixed(v.parse().unwrap()),
     };
     let d: Vec<f32> = std::env::var("DSHIFT").unwrap_or("0,0,0".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    // SHIFTS="r,g,b;r,g,b;..." replaces the real shifts (e.g. open-pakon's own KCDFS ones).
+    let sh: Vec<[f32; 3]> = match std::env::var("SHIFTS") {
+        Ok(v) => v.split(';').map(|f| { let p: Vec<f32> = f.split(',').map(|x| x.parse().unwrap()).collect(); [p[0], p[1], p[2]] }).collect(),
+        Err(_) => SH.to_vec(),
+    };
     let (w, h) = (2250usize, 1500usize);
     let lut = u16s(&format!("{dir}/scp_lut.u16"));
     for f in 1..=4 {
@@ -30,7 +35,7 @@ fn main() {
                 for x in 0..w {
                     for c in 0..3 {
                         let v = raw[c * w * h + y * w + x].min(4095) as usize;
-                        row.push((lut[c * 4096 + v] as f32 + SH[f - 1][c] + d[c]).clamp(0.0, 4095.0));
+                        row.push((lut[c * 4096 + v] as f32 + sh[f - 1][c] + d[c]).clamp(0.0, 4095.0));
                     }
                 }
                 row
