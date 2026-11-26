@@ -11,6 +11,34 @@ use rayon::prelude::*;
 
 const MAXV: usize = 4095;
 
+// The DLL's C-41 EBP runs on 8-bit sRGB data (the `E` template instances: 256-bin
+// histograms, 256-entry LUTs) with the *plain* attribute defaults (probe dump,
+// `PROBE_FINDINGS.md`). We emulate it on the 12-bit machinery by feeding `v8 << 4`
+// and switching the constants with `set_plain8(true)`.
+thread_local! { static PLAIN8: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+/// Per calling thread (the stages read it before they fan out to rayon).
+pub fn set_plain8(on: bool) {
+    PLAIN8.with(|c| c.set(on));
+}
+fn plain8() -> bool {
+    PLAIN8.with(|c| c.get())
+}
+fn black_pct() -> f64 {
+    if plain8() { 0.10 } else { BLACK_PCT }
+}
+fn white_pct() -> f64 {
+    if plain8() { 0.15 } else { WHITE_PCT }
+}
+fn mean_lo_pct() -> f64 {
+    if plain8() { 39.06 } else { MEAN_LO_PCT }
+}
+fn mean_hi_pct() -> f64 {
+    if plain8() { 48.82 } else { MEAN_HI_PCT }
+}
+fn citras() -> f64 {
+    if plain8() { 0.5 } else { CITRAS }
+}
+
 /// A 12-bit three-plane image.
 #[derive(Debug, Clone)]
 pub struct Planes {
@@ -103,8 +131,8 @@ pub fn gain_and_offset(img: &mut Planes) -> GainInfo {
             hist[c][(s >> 8).clamp(0, 255) as usize] += 1;
         }
     }
-    let nb = (n as f64 * BLACK_PCT * 0.01 + 0.5) as u64;
-    let nw = (n as f64 * WHITE_PCT * 0.01 + 0.5) as u64;
+    let nb = (n as f64 * black_pct() * 0.01 + 0.5) as u64;
+    let nw = (n as f64 * white_pct() * 0.01 + 0.5) as u64;
     let mut lo = [0i32; 3];
     let mut hi = [0i32; 3];
     let mut valid = [false; 3];
@@ -144,7 +172,9 @@ pub fn gain_and_offset(img: &mut Planes) -> GainInfo {
     if t < lo[1] && valid[1] {
         lo[1] = t;
     }
-    let r: [i32; 3] = std::array::from_fn(|c| hi[c] - lo[c]);
+    // A channel whose percentile range is under 4 levels counts as empty (range 0, which
+    // makes the whole stage the identity). Probe data: P3a_2000_3000, P3b s200 vs s500.
+    let r: [i32; 3] = std::array::from_fn(|c| if hi[c] - lo[c] < 4 { 0 } else { hi[c] - lo[c] });
     let tot: i32 = r.iter().sum();
     let gain_avg = if tot > 0 { 3.0 * 255.0 / tot as f64 } else { 1.0 };
     let minr = *r.iter().min().unwrap();
@@ -249,8 +279,8 @@ pub struct GammaEstimate {
 pub fn estimate_gamma(img: &Planes) -> GammaEstimate {
     let (w, h) = (img.w, img.h);
     let n = w * h;
-    let t_lo = (MEAN_LO_PCT * 2.56).ceil();
-    let t_hi = (MEAN_HI_PCT * 2.56).ceil();
+    let t_lo = (mean_lo_pct() * 2.56).ceil();
+    let t_hi = (mean_hi_pct() * 2.56).ceil();
     let l8: Vec<i32> = (0..n).map(|i| (((img.p[0][i] as i32 + img.p[1][i] as i32 + img.p[2][i] as i32) + 1) / 3) >> 4).collect();
     let s5 = binom5(&l8, w, h);
     let mut hist = [0i64; 256];
@@ -305,7 +335,7 @@ pub fn estimate_gamma(img: &Planes) -> GammaEstimate {
             if cnt > 0 {
                 let e = sum / cnt as f64 / 255.0;
                 if e.ln() != 0.0 {
-                    g1 = ((MEAN_HI_PCT * 0.01 + e) * 0.5).ln() / e.ln();
+                    g1 = ((mean_hi_pct() * 0.01 + e) * 0.5).ln() / e.ln();
                 }
             }
         }
@@ -335,7 +365,7 @@ pub fn gamma_correction(img: &mut Planes, p: f64, mode: Gamma) -> f64 {
             if !slope.is_finite() {
                 slope = 1.0;
             }
-            (((slope - 1.0) * CITRAS + 1.0) * (1.0 / p) * 4096.0 + 0.5).floor() as i32
+            (((slope - 1.0) * citras() + 1.0) * (1.0 / p) * 4096.0 + 0.5).floor() as i32
         })
         .collect();
     let [pr, pg, pb] = &mut img.p;

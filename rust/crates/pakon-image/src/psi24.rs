@@ -56,11 +56,32 @@ pub fn render(rpd: &[Vec<f32>], gamma: Gamma) -> (Array3<u16>, f64) {
             }
         });
     }
+    // The DLL's EBP runs on 8-bit sRGB (see `ebp::set_plain8`): convert first.
+    // `PSI24_ROMM12=1` keeps the old 12-bit ROMM path for comparisons.
+    let e8 = std::env::var("PSI24_ROMM12").is_err();
+    ebp::set_plain8(e8);
+    if e8 && w > 0 {
+        let [pr, pg, pb] = &mut pl.p;
+        pr.par_chunks_mut(w).zip(pg.par_chunks_mut(w)).zip(pb.par_chunks_mut(w)).for_each(|((r, g), b)| {
+            for x in 0..w {
+                let s = t.romm_srgb.lookup([r[x] as f32 / 4095.0, g[x] as f32 / 4095.0, b[x] as f32 / 4095.0]);
+                r[x] = ((s[0] * 255.0 + 0.5) as u16).min(255) << 4;
+                g[x] = ((s[1] * 255.0 + 0.5) as u16).min(255) << 4;
+                b[x] = ((s[2] * 255.0 + 0.5) as u16).min(255) << 4;
+            }
+        });
+    }
     let used = if w > 0 { ebp::enhanced_black_printing(&mut pl, gamma).1 } else { 1.0 };
     let mut out = Array3::<u16>::zeros((h, w, 3));
     out.axis_iter_mut(ndarray::Axis(0)).into_par_iter().enumerate().for_each(|(y, mut orow)| {
         for x in 0..w {
             let i = y * w + x;
+            if e8 {
+                for c in 0..3 {
+                    orow[(x, c)] = (pl.p[c][i] >> 4).min(255) * 257;
+                }
+                continue;
+            }
             let s = t.romm_srgb.lookup([pl.p[0][i] as f32 / 4095.0, pl.p[1][i] as f32 / 4095.0, pl.p[2][i] as f32 / 4095.0]);
             for c in 0..3 {
                 orow[(x, c)] = (s[c] * 65535.0 + 0.5).clamp(0.0, 65535.0) as u16;
