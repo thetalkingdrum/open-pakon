@@ -45,7 +45,9 @@ fn node_x(v: f32) -> f32 {
 
 #[inline]
 fn cmm_at(tab: &Table, row: &[f32], x: usize) -> [f32; 3] {
-    tab.lookup([node_x(row[3 * x]), node_x(row[3 * x + 1]), node_x(row[3 * x + 2])])
+    let q = [node_x(row[3 * x]), node_x(row[3 * x + 1]), node_x(row[3 * x + 2])];
+    static TRI: OnceLock<bool> = OnceLock::new();
+    if *TRI.get_or_init(|| std::env::var("PSI24_TRILIN").is_ok()) { tab.lookup(q) } else { tab.lookup_tetra(q) }
 }
 
 /// `PSI24_CMM_T5=1`: use the type-5 table for the 8-bit path too (A/B only).

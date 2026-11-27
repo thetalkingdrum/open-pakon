@@ -144,6 +144,40 @@ impl Table {
         }
         acc.map(|a| a as f32)
     }
+
+    /// Tetrahedral lookup (the cube cell is split into 6 tetrahedra along the main diagonal): follows a
+    /// clipped surface better than trilinear because only 4 corners contribute.
+    #[inline]
+    pub fn lookup_tetra(&self, x01: [f32; 3]) -> [f32; 3] {
+        let n = self.n;
+        let mut i = [0usize; 3];
+        let mut fr = [0f64; 3];
+        for c in 0..3 {
+            let f = x01[c].clamp(0.0, 1.0) * (n - 1) as f32;
+            let k = (f as i32).min(n as i32 - 2);
+            i[c] = k as usize;
+            fr[c] = f as f64 - k as f64;
+        }
+        let at = |d: [usize; 3]| 3 * (((i[0] + d[0]) * n + i[1] + d[1]) * n + i[2] + d[2]);
+        let mut ord = [0usize, 1, 2];
+        ord.sort_by(|&a, &b| fr[b].partial_cmp(&fr[a]).unwrap());
+        let mut d = [0usize; 3];
+        let mut e = at(d);
+        let mut acc = [0f64; 3];
+        for c in 0..3 {
+            acc[c] = self.data[e + c] as f64;
+        }
+        for &ax in &ord {
+            d[ax] = 1;
+            let e2 = at(d);
+            let wgt = fr[ax];
+            for c in 0..3 {
+                acc[c] += wgt * (self.data[e2 + c] as f64 - self.data[e + c] as f64);
+            }
+            e = e2;
+        }
+        acc.map(|a| a as f32)
+    }
 }
 
 /// Per-picture adjustments in TLX units (`clean_adjust`): one slider click
