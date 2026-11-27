@@ -12,7 +12,7 @@ fn main() {
     let mut info = String::new();
     match a[2].as_str() {
         "go" => { let g = ebp::gain_and_offset(&mut pl); info = format!("{g:?}"); }
-        "gamma" => { let est = ebp::estimate_gamma(&pl); info = format!("est gamma {:.3}", est.gamma); let p = std::env::var("P").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0); let g = ebp::gamma_correction(&mut pl, p, Gamma::Auto { cap: 9.0 }); info += &format!(" used {g:.3}"); }
+        "gamma" => { let est = ebp::estimate_gamma(&pl); info = format!("est gamma {:.3}", est.gamma); let p = std::env::var("P").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0); let gm = match std::env::var("GFIX").ok().and_then(|v| v.parse().ok()) { Some(v) => Gamma::Fixed(v), None => Gamma::Auto { cap: 9.0 } }; let g = ebp::gamma_correction(&mut pl, p, gm); info += &format!(" used {g:.3}"); }
         "nf" => ebp::noise_filter(&mut pl),
         "bp" => ebp::black_print(&mut pl),
         "all" => { let (g, gm) = ebp::enhanced_black_printing(&mut pl, Gamma::Auto { cap: 9.0 }); info = format!("{g:?} gamma {gm:.3}"); }

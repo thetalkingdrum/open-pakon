@@ -103,6 +103,11 @@ fn binom3(src: &[i32], w: usize, h: usize) -> Vec<i32> {
 /// by its weight sum with truncation (`>> 4` for [1 4 6 4 1], `>> 2` for
 /// [1 2 1]); reproduces the DLL's dumped histograms bit for bit. Returns 8-bit values.
 fn blur_floor(src: &[i32], w: usize, h: usize, k: &[i32], shift: u32) -> Vec<i32> {
+    blur_shift(src, w, h, k, shift, 0)
+}
+
+/// [`blur_floor`] with `add` added before each pass's shift (`1 << (shift - 1)` rounds).
+fn blur_shift(src: &[i32], w: usize, h: usize, k: &[i32], shift: u32, add: i32) -> Vec<i32> {
     let r = k.len() / 2;
     let mut tmp = vec![0i32; w * h];
     tmp.par_chunks_mut(w).enumerate().for_each(|(y, out)| {
@@ -112,7 +117,7 @@ fn blur_floor(src: &[i32], w: usize, h: usize, k: &[i32], shift: u32) -> Vec<i32
             for (i, wt) in k.iter().enumerate() {
                 s += wt * row[(x + i).saturating_sub(r).min(w - 1)];
             }
-            out[x] = s >> shift;
+            out[x] = (s + add) >> shift;
         }
     });
     let mut out = vec![0i32; w * h];
@@ -122,7 +127,7 @@ fn blur_floor(src: &[i32], w: usize, h: usize, k: &[i32], shift: u32) -> Vec<i32
             for (i, wt) in k.iter().enumerate() {
                 s += wt * tmp[((y + i).saturating_sub(r)).min(h - 1) * w + x];
             }
-            o[x] = s >> shift;
+            o[x] = (s + add) >> shift;
         }
     });
     out
@@ -284,6 +289,13 @@ pub fn gain_and_offset(img: &mut Planes) -> GainInfo {
         let l = &luts[c];
         img.p[c].par_iter_mut().for_each(|v| *v = l[(*v as usize).min(MAXV)]);
     }
+    if plain8() {
+        // the DLL's 8-bit instance stores a byte: keep no fractional bits of the 12-bit knee LUT
+        // (otherwise Gamma's `>> 4` truncates them away, a -0.5 bias)
+        for c in 0..3 {
+            img.p[c].par_iter_mut().for_each(|v| *v = (((*v as u32 + 8) >> 4).min(255) << 4) as u16);
+        }
+    }
     GainInfo { lo, hi, lo2, hi2, k1, p: k1 * gain_avg, off, s, knee }
 }
 
@@ -323,7 +335,10 @@ pub fn estimate_gamma(img: &Planes) -> GammaEstimate {
     let t_lo = (mean_lo_pct() * 2.56).ceil();
     let t_hi = (mean_hi_pct() * 2.56).ceil();
     let l8: Vec<i32> = (0..n).map(|i| if plain8() { ((img.p[0][i] >> 4) as i32 + (img.p[1][i] >> 4) as i32 + (img.p[2][i] >> 4) as i32 + 1) / 3 } else { (((img.p[0][i] as i32 + img.p[1][i] as i32 + img.p[2][i] as i32) + 1) / 3) >> 4 }).collect();
-    let (s5, s5_scale) = if plain8() { (blur_floor(&l8, w, h, &[1, 4, 6, 4, 1], 4), 1.0) } else { (binom5(&l8, w, h), 256.0) };
+    // The Gamma estimator's histogram is the luma blurred with ROUNDING passes (unlike the G&O
+    // histogram, which truncates): reproduces the DLL's gamma (struct +0x58) on frames 1, 2 and 4
+    // to 3e-4, truncating is 0.004-0.008 low.
+    let (s5, s5_scale) = if plain8() { (blur_shift(&l8, w, h, &[1, 4, 6, 4, 1], 4, 8), 1.0) } else { (binom5(&l8, w, h), 256.0) };
     let mut hist = [0i64; 256];
     for &s in &s5 {
         hist[if plain8() { s } else { (s + 128) >> 8 }.clamp(0, 255) as usize] += 1;
