@@ -489,6 +489,11 @@ pub fn enhanced_black_printing(img: &mut Planes, gamma: Gamma) -> (GainInfo, f64
 // 11:4:1 (no measurable effect).
 
 fn conv_sep(src: &[i32], w: usize, h: usize, co: &[i32], norm: impl Fn(i32) -> i32 + Sync) -> Vec<i32> {
+    conv_sep_v(src, w, h, co, co, norm)
+}
+
+/// [`conv_sep`] with its own taps `cv` for the vertical pass.
+fn conv_sep_v(src: &[i32], w: usize, h: usize, co: &[i32], cv: &[i32], norm: impl Fn(i32) -> i32 + Sync) -> Vec<i32> {
     let k = co.len();
     let l = (k - 1) / 2;
     let mut tmp = vec![0i32; w * h];
@@ -507,7 +512,7 @@ fn conv_sep(src: &[i32], w: usize, h: usize, co: &[i32], norm: impl Fn(i32) -> i
     out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         for x in 0..w {
             let mut acc = 0;
-            for (i, &c) in co.iter().enumerate() {
+            for (i, &c) in cv.iter().enumerate() {
                 let yy = (y as isize + i as isize - l as isize).clamp(0, h as isize - 1) as usize;
                 acc += c * tmp[yy * w + x];
             }
@@ -544,7 +549,9 @@ fn blur_bp_trunc(src: &[i32], w: usize, h: usize) -> Vec<i32> {
 }
 
 fn nf_hp(y: &[i32], w: usize, h: usize, k: usize) -> Vec<usize> {
-    let lp = if k == 3 { conv_sep(y, w, h, &[1, 3, 1], |a| a / 5) } else { conv_sep(y, w, h, &[1, 4, 6, 4, 1], |a| a >> 4) };
+    // The DLL's vertical lp3 (FUN_10170b90, k == 3) overwrites its row buffer before reloading it, so it
+    // weights rows (y-1, y, y+1) as [1, 2, 2]/5, not [1, 3, 1]/5 (a 0.2 px shift; horizontal stays [1, 3, 1]).
+    let lp = if k == 3 { conv_sep_v(y, w, h, &[1, 3, 1], &[1, 2, 2], |a| a / 5) } else { conv_sep(y, w, h, &[1, 4, 6, 4, 1], |a| a >> 4) };
     y.iter().zip(&lp).map(|(&a, &b)| ((a - b + 128) & 255) as usize).collect()
 }
 
@@ -713,7 +720,9 @@ pub fn hq_params(q8: &mut Planes, gamma: Gamma) -> HqParams {
     let (w, h) = (q8.w, q8.h);
     let raw: [Vec<i32>; 3] = std::array::from_fn(|c| q8.p[c].iter().map(|&v| ((v >> 4) as i32).min(255)).collect());
     let nv = if w >= 3 && h >= 3 { noise_level(&raw[0], &raw[2], w, h) as f64 } else { 0.0 };
-    noise_filter(q8);
+    if std::env::var("PSI24_NO_NF").is_err() {
+        noise_filter(q8);
+    }
     let tot: i64 = q8.p.iter().map(|p| p.iter().map(|&v| ((v as i64 + 8) >> 4).min(255)).sum::<i64>()).sum();
     HqParams { gain, gamma: g, nv, bp_mean: tot as f64 / (3 * w * h).max(1) as f64 }
 }
@@ -742,15 +751,17 @@ fn go_hq(f: &mut FPlanes, gi: &GainInfo) {
 }
 
 fn gamma_hq(f: &mut FPlanes, p: f64, g: f64) {
+    // thread-local `PLAIN8` is only set on the calling thread: read it before going parallel
+    let cit = citras();
     let [pr, pg, pb] = &mut f.p;
     pr.par_iter_mut().zip(pg.par_iter_mut()).zip(pb.par_iter_mut()).for_each(|((r, gg), b)| {
         let l = ((*r + *gg + *b) as f64 / 3.0).max(0.0);
         let ln = 255.0 * (l / 255.0).powf(g);
-        let mut slope = (l / (255.0 * p)).powf(g - 1.0) * p.powf(g) * g;
+        let mut slope = (l.max(1.0) / (255.0 * p)).powf(g - 1.0) * p.powf(g) * g;
         if !slope.is_finite() {
             slope = 1.0;
         }
-        let gk = ((slope - 1.0) * citras() + 1.0) / p;
+        let gk = ((slope - 1.0) * cit + 1.0) / p;
         for v in [r, gg, b] {
             *v = (ln + (*v as f64 - l) * gk).clamp(0.0, 255.0) as f32;
         }
