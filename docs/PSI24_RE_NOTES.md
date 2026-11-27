@@ -187,3 +187,14 @@ LittleCMS rpd -> romm -> srgb pair and the fitted `PRE_R/G/B` (still reachable w
   (mean 1.075 -> 1.015); probe suite HQ M3/M4 1.22/1.09 -> 1.19/1.09. The surface is flat near the optimum and frames still disagree
   (frames 2/3, both with the gamma clamped at 0.7, stay -0.6..-1.2 low in G, frame 4 is +0.2..+0.6): a content-dependent loss is
   left, not a constant one. Fitted on 12 images, no held-out set yet (the second film stock will be one).
+
+## Second roll (Task 3, Base 16, 3000x2000): held-out check and the Gamma g1 branch
+
+New roll, 8 frames, real DLL stage dumps (`psi24-film2.zip`). Base 16 frames are 3000x2000; the port needs no change except the size (`PSI24_W/PSI24_H` for `psi24_probe`/`psi24_stage`).
+
+- Gamma struct (`this` after build): `+0x50` = g1, `+0x58` = g2, `+0x60` = the exponent used (blend), `+0x68` = trimmed mean. `+0x10` is NOT the exponent.
+- g2 and the blend were already exact on all frames (0.7112, 0.8047, 0.9323, 0.9174, 0.9889 reproduced to 4 digits).
+- g1 was wrong on bright frames: the old edge rule `trunc(0.75*sigma)` gave g1 1.09 where the DLL has 0.957 (frame 11), 1.057 vs 0.796 (frame 12). The old roll never reached this branch. Edge pixels `|binom3-binom5| > k*sigma`, continuous (no truncation), fit all five real g1 for `k` in 0.87..1.02; `EDGE_THR = 1.0`. Residual g1 error +0.001..+0.019 (frame 17 largest), so the rule is close but probably not exactly the DLL's.
+- Result with auto gamma (exact path, MAE vs real look): frames 3/7/10/11/12/15/17/21 = 0.71/0.80/0.69/1.02/0.46/1.22/1.71/0.85; HQ 1.29/1.12/1.22/1.47/1.06/1.43/1.59/1.07. Before the g1 fix frames 11/15/17/21 were 8.8/1.6/1.6/3.1.
+- No regression on roll 1 (probe suite exact 0.77/0.68, HQ 1.19/1.07).
+- Not reached: `nv <= 0.25` (lowest nv on this roll 0.294); KCDFS shifts only valid for frames 1..25 of a 37-frame roll.

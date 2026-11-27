@@ -299,7 +299,9 @@ const G_LO: f64 = 0.7;
 const G_HI: f64 = 2.0;
 const MEAN_LO_PCT: f64 = 30.07;
 const MEAN_HI_PCT: f64 = 39.84;
-const EDGE_THR: f64 = 0.75;
+/// Edge pixels are those with |binom3 - binom5| above `EDGE_THR * sigma` (continuous, two-sided; the DLL value
+/// fits g1 on five bright frames of a second roll for k in 0.87..1.02; the old trunc(0.75 sigma) did not).
+const EDGE_THR: f64 = 1.0;
 const CITRAS: f64 = 0.6;
 
 /// How Gamma picks its exponent.
@@ -374,7 +376,7 @@ pub fn estimate_gamma(img: &Planes) -> GammaEstimate {
             let d = |i: usize| s3[i] as f64 / s3_scale - s5[i] as f64 / s5_scale;
             let ss: f64 = (0..n).into_par_iter().map(|i| d(i) * d(i)).sum();
             let sig = (ss / (n.max(2) - 1) as f64).sqrt();
-            let thr = (sig * EDGE_THR).trunc();
+            let thr = sig * EDGE_THR;
             let (mut sum, mut cnt) = (0f64, 0u64);
             for i in 0..n {
                 if d(i).abs() > thr {

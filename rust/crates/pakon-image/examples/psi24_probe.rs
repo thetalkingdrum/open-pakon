@@ -19,7 +19,8 @@ fn main() {
         None | Some("auto") => Gamma::Auto { cap: 9.0 },
         Some(v) => Gamma::Fixed(v.parse().unwrap()),
     };
-    let (w, h) = (2250usize, 1500usize);
+    let ev = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (w, h) = (ev("PSI24_W", 2250), ev("PSI24_H", 1500));
     let rpd: Vec<Vec<f32>> = (0..h)
         .map(|y| {
             let mut row = Vec::with_capacity(3 * w);

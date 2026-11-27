@@ -3,7 +3,8 @@
 use pakon_image::ebp::{self, Gamma, Planes};
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let (w, h) = (2250usize, 1500usize);
+    let ev = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (w, h) = (ev("PSI24_W", 2250), ev("PSI24_H", 1500));
     let inp = std::fs::read(&a[1]).unwrap();
     let rf = std::fs::read(&a[3]).unwrap();
     let mut pl = Planes::new(w, h);
