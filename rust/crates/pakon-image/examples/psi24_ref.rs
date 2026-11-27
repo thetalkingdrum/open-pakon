@@ -42,7 +42,7 @@ fn main() {
             })
             .collect();
         let t = std::time::Instant::now();
-        let (out, g) = psi24::render(&rpd, gm);
+        let (out, g) = if std::env::var("PSI24_HQ").is_ok() { psi24::render_hq(&rpd, gm) } else { psi24::render(&rpd, gm) };
         let el = t.elapsed();
         let real = std::fs::read(format!("{dir}/look0{f}.rgb")).unwrap();
         let mut mae = [0f64; 3];

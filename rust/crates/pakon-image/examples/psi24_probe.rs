@@ -1,3 +1,4 @@
+//! (`PSI24_HQ=1` renders with the high-bit-depth path, quantised to 8 bit for the comparison.)
 //! Compare our render with a probe output: `psi24_probe <lut.u16> <in.raw> <ref.rgb> <shifts r,g,b|0> [gamma]`
 use pakon_image::ebp::Gamma;
 use pakon_image::psi24;
@@ -31,7 +32,7 @@ fn main() {
             row
         })
         .collect();
-    let (out, g) = psi24::render(&rpd, gm);
+    let (out, g) = if std::env::var("PSI24_HQ").is_ok() { psi24::render_hq(&rpd, gm) } else { psi24::render(&rpd, gm) };
     if let Ok(path) = std::env::var("PROBE_OUT") { // planar 8-bit RGB like the .rgb files
         let mut o = vec![0u8; 3 * w * h];
         for y in 0..h { for x in 0..w { for c in 0..3 { o[c * w * h + y * w + x] = ((out[(y, x, c)] as u32 + 128) / 257) as u8; } } }

@@ -10,7 +10,7 @@ use ndarray::Array3;
 use rayon::prelude::*;
 
 use crate::colour::Table;
-use crate::ebp::{self, Gamma, Planes};
+use crate::ebp::{self, FPlanes, Gamma, Planes};
 
 /// rpd_24.pf -> romm.pf, 65^3 u16 (`assets/make_psi24_tables.py`).
 pub const RPD24_ROMM_U16: &[u8] = include_bytes!("../assets/rpd_24.romm65.u16");
@@ -114,6 +114,74 @@ pub fn render(rpd: &[Vec<f32>], gamma: Gamma) -> (Array3<u16>, f64) {
 }
 
 
+/// High-bit-depth render: same pipeline and decisions as [`render`], but the 8-bit EBP stages run
+/// continuously on float planes ([`ebp::hq_apply`]) and nothing is quantised between the ICC
+/// tables (16-bit, trilinear in f64) and the output. Returns sRGB on a 0..255 float scale plus the
+/// Gamma exponent. All parameter decisions come from the exact 8-bit chain (run on a clone).
+pub fn render_hq_f32(rpd: &[Vec<f32>], gamma: Gamma) -> (Vec<Vec<f32>>, usize, usize, f64) {
+    let t = tables();
+    let h = rpd.len();
+    let w = if h > 0 { rpd[0].len() / 3 } else { 0 };
+    if w == 0 {
+        return (vec![], 0, h, 1.0);
+    }
+    let corr = std::env::var("PSI24_NO_PRECORR").is_err();
+    let mut f = FPlanes { w, h, p: std::array::from_fn(|_| vec![0f32; w * h]) };
+    let mut q8 = Planes::new(w, h);
+    {
+        let [fr, fg, fb] = &mut f.p;
+        let [qr, qg, qb] = &mut q8.p;
+        fr.par_chunks_mut(w).zip(fg.par_chunks_mut(w)).zip(fb.par_chunks_mut(w)).zip(qr.par_chunks_mut(w).zip(qg.par_chunks_mut(w)).zip(qb.par_chunks_mut(w))).enumerate().for_each(|(y, (((fr, fg), fb), ((qr, qg), qb)))| {
+            let row = &rpd[y];
+            for x in 0..w {
+                let rm = t.rpd_romm.lookup([row[3 * x] / 4095.0, row[3 * x + 1] / 4095.0, row[3 * x + 2] / 4095.0]);
+                // exact statistics path: the 12-bit ROMM round trip, 8-bit rounding (like `render`)
+                let s = t.romm_srgb.lookup([to12(rm[0]) as f32 / 4095.0, to12(rm[1]) as f32 / 4095.0, to12(rm[2]) as f32 / 4095.0]);
+                let c8 = |v: f32, k: &[f32; 16], fade: bool| v * 255.0 + if corr { pre_corr(v * 255.0, k, fade) } else { 0.0 };
+                let (r8, g8, b8) = (c8(s[0], &PRE_R, false), c8(s[1], &PRE_G, true), c8(s[2], &PRE_B, true));
+                qr[x] = ((r8 + 0.5).clamp(0.0, 255.0) as u16) << 4;
+                qg[x] = ((g8 + 0.5).clamp(0.0, 255.0) as u16) << 4;
+                qb[x] = ((b8 + 0.5).clamp(0.0, 255.0) as u16) << 4;
+                // HQ path: no 12-bit round trip, continuous correction, no rounding
+                let s = t.romm_srgb.lookup(rm);
+                fr[x] = c8(s[0], &PRE_R, false).clamp(0.0, 255.0);
+                fg[x] = c8(s[1], &PRE_G, true).clamp(0.0, 255.0);
+                fb[x] = c8(s[2], &PRE_B, true).clamp(0.0, 255.0);
+            }
+        });
+    }
+    ebp::set_plain8(true);
+    let params = ebp::hq_params(&mut q8, gamma);
+    drop(q8);
+    ebp::hq_apply(&mut f, &params);
+    let rows: Vec<Vec<f32>> = (0..h)
+        .map(|y| {
+            let mut row = Vec::with_capacity(3 * w);
+            for x in 0..w {
+                for c in 0..3 {
+                    row.push(f.p[c][y * w + x]);
+                }
+            }
+            row
+        })
+        .collect();
+    (rows, w, h, params.gamma)
+}
+
+/// 16-bit output of [`render_hq_f32`] (`v * 257`, so 8-bit levels map to the same codes as [`render`]).
+pub fn render_hq(rpd: &[Vec<f32>], gamma: Gamma) -> (Array3<u16>, f64) {
+    let (rows, w, h, g) = render_hq_f32(rpd, gamma);
+    let mut out = Array3::<u16>::zeros((h, w, 3));
+    out.axis_iter_mut(ndarray::Axis(0)).into_par_iter().enumerate().for_each(|(y, mut orow)| {
+        for x in 0..w {
+            for c in 0..3 {
+                orow[(x, c)] = (rows[y][3 * x + c] * 257.0 + 0.5).clamp(0.0, 65535.0) as u16;
+            }
+        }
+    });
+    (out, g)
+}
+
 /// Measured difference (real - ours) of the 8-bit sRGB entering EBP, at knots 0, 16, .. 240 per
 /// channel. Fitted by quantile (histogram) matching of our pre-EBP channel against the real `s0`
 /// dumps, pooled over all four reference frames (the Gain & Offset stage is histogram driven, and
@@ -157,6 +225,44 @@ mod tests {
                 last[c] = s[c];
             }
         }
+    }
+
+    #[test]
+    fn hq_stays_close_to_the_8bit_path_and_has_no_banding() {
+        // smooth gradient with some texture, wide enough to give the stages real work
+        let (w, h) = (600usize, 300usize);
+        let rpd: Vec<Vec<f32>> = (0..h)
+            .map(|y| {
+                (0..3 * w)
+                    .map(|i| {
+                        let (x, c) = (i / 3, i % 3);
+                        let t = x as f32 / (w - 1) as f32;
+                        let tex = (((x * 7 + y * 13 + c * 5) % 17) as f32 - 8.0) * 3.0;
+                        (700.0 + (2900.0 - c as f32 * 150.0) * t + tex).clamp(0.0, 4095.0)
+                    })
+                    .collect()
+            })
+            .collect();
+        let (a, ga) = render(&rpd, Gamma::Auto { cap: GAMMA_CAP });
+        let (b, gb) = render_hq(&rpd, Gamma::Auto { cap: GAMMA_CAP });
+        assert!((ga - gb).abs() < 1e-9);
+        let (mut mae, mut bias) = (0f64, 0f64);
+        for (p, q) in a.iter().zip(b.iter()) {
+            let d = (*q as f64 - *p as f64) / 257.0;
+            mae += d.abs();
+            bias += d;
+        }
+        let n = a.len() as f64;
+        assert!(mae / n < 1.6, "MAE {}", mae / n);
+        assert!((bias / n).abs() < 1.2, "bias {}", bias / n);
+        // a smooth row must have many more distinct 16-bit values than the 256 of the 8-bit path
+        let mut d8: Vec<u16> = (0..w).map(|x| a[(150, x, 1)]).collect();
+        let mut d16: Vec<u16> = (0..w).map(|x| b[(150, x, 1)]).collect();
+        d8.sort();
+        d8.dedup();
+        d16.sort();
+        d16.dedup();
+        assert!(d16.len() > d8.len() + d8.len() / 2, "hq {} vs 8-bit {}", d16.len(), d8.len());
     }
 
     #[test]

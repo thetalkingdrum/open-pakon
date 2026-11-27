@@ -138,6 +138,11 @@ pub struct GainInfo {
     pub k1: f64,
     /// `k1 * 3*255/sum(ranges)`: what the Gamma stage reads from this one.
     pub p: f64,
+    /// Stage-1 offsets (8-bit units) and gains, as applied (for the HQ path).
+    pub off: [i32; 3],
+    pub s: [f64; 3],
+    /// Knee `(l2, h2, tl, th, k1, k2)` in 12-bit units, `None` when only stage 1 ran.
+    pub knee: Option<[f64; 6]>,
 }
 
 // Romm12 defaults of ImaEBPGainAndOffsetOp.
@@ -245,6 +250,7 @@ pub fn gain_and_offset(img: &mut Planes) -> GainInfo {
     }
     let hi2 = u as i32;
     let mut k1 = 1.0;
+    let mut knee = None;
     let mut luts: [Vec<u16>; 3] = Default::default();
     let stage1_only = if std::env::var("EBP_OR").is_ok() { lo2 <= SHADOW_THR || HIGHLIGHT_THR <= hi2 } else { lo2 <= SHADOW_THR && HIGHLIGHT_THR <= hi2 } || (hi2 as f64) < lo2 as f64 + 63.75;
     if stage1_only {
@@ -257,6 +263,7 @@ pub fn gain_and_offset(img: &mut Planes) -> GainInfo {
         let (l2, h2f, tl, th) = ((lo2 << 4) as f64, (hi2 << 4) as f64, (tgt_lo << 4) as f64, (tgt_hi << 4) as f64);
         k1 = if h2f > l2 { (th - tl) / (h2f - l2) } else { 1.0 };
         let k2 = if (MAXV as f64) > h2f { (MAXV as f64 - th) / (MAXV as f64 - h2f) } else { 1.0 };
+        knee = Some([l2, h2f, tl, th, k1, k2]);
         for c in 0..3 {
             luts[c] = (0..=MAXV)
                 .map(|x| {
@@ -277,7 +284,7 @@ pub fn gain_and_offset(img: &mut Planes) -> GainInfo {
         let l = &luts[c];
         img.p[c].par_iter_mut().for_each(|v| *v = l[(*v as usize).min(MAXV)]);
     }
-    GainInfo { lo, hi, lo2, hi2, k1, p: k1 * gain_avg }
+    GainInfo { lo, hi, lo2, hi2, k1, p: k1 * gain_avg, off, s, knee }
 }
 
 // Romm12 defaults of ImaEBPGammaOp.
@@ -669,6 +676,225 @@ pub fn black_print(img: &mut Planes) {
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------------------------------
+// High-bit-depth ("HQ") path. The same four 'E' stages in the sRGB domain, on float planes with
+// the 0..255 scale, without any quantisation between the stages. Every *decision* (G&O lo/hi/lo2/
+// hi2/k1/p, the Gamma exponent, the Noise Filter nv/X/m/A/B, the Black Print mean) is taken from
+// the exact 8-bit chain ([`hq_params`]), so the look is the one of the bit-exact path; only the
+// curves and filters are applied continuously. Thresholds stay on the 0..255 scale.
+
+/// A float three-plane image, values on a 0..255 scale (not clamped between the stages except where
+/// the 8-bit stage clamps).
+#[derive(Debug, Clone)]
+pub struct FPlanes {
+    pub w: usize,
+    pub h: usize,
+    pub p: [Vec<f32>; 3],
+}
+
+/// Decisions of the exact 8-bit chain, the parameters of [`hq_apply`].
+#[derive(Debug, Clone, Copy)]
+pub struct HqParams {
+    pub gain: GainInfo,
+    pub gamma: f64,
+    /// Noise estimate entering the Noise Filter (after Gamma).
+    pub nv: f64,
+    /// Black Print mean over all samples (after the Noise Filter).
+    pub bp_mean: f64,
+}
+
+/// Run the exact 8-bit chain on `q8` (8-bit values held as `v8 << 4`, [`set_plain8`] on) and
+/// record its decisions. `q8` ends up as the exact 8-bit result.
+pub fn hq_params(q8: &mut Planes, gamma: Gamma) -> HqParams {
+    let gain = gain_and_offset(q8);
+    let g = gamma_correction(q8, gain.p, gamma);
+    let (w, h) = (q8.w, q8.h);
+    let raw: [Vec<i32>; 3] = std::array::from_fn(|c| q8.p[c].iter().map(|&v| ((v >> 4) as i32).min(255)).collect());
+    let nv = if w >= 3 && h >= 3 { noise_level(&raw[0], &raw[2], w, h) as f64 } else { 0.0 };
+    noise_filter(q8);
+    let tot: i64 = q8.p.iter().map(|p| p.iter().map(|&v| ((v as i64 + 8) >> 4).min(255)).sum::<i64>()).sum();
+    HqParams { gain, gamma: g, nv, bp_mean: tot as f64 / (3 * w * h).max(1) as f64 }
+}
+
+/// Stage 1 + knee of Gain and Offset, continuous. `v` on the 0..255 scale.
+fn go_hq(f: &mut FPlanes, gi: &GainInfo) {
+    for c in 0..3 {
+        let (off, s) = (gi.off[c] as f64, gi.s[c]);
+        f.p[c].par_iter_mut().for_each(|v| {
+            let y1 = (*v as f64 - off) * s * 16.0; // 12-bit units
+            let y = match gi.knee {
+                None => y1,
+                Some([l2, h2, tl, th, k1, k2]) => {
+                    if y1 < l2 {
+                        y1 * if l2 != 0.0 { tl / l2 } else { 1.0 }
+                    } else if y1 <= h2 {
+                        tl + (y1 - l2) * k1
+                    } else {
+                        th + (y1 - h2) * k2
+                    }
+                }
+            };
+            *v = (y / 16.0).clamp(0.0, 255.0) as f32;
+        });
+    }
+}
+
+fn gamma_hq(f: &mut FPlanes, p: f64, g: f64) {
+    let [pr, pg, pb] = &mut f.p;
+    pr.par_iter_mut().zip(pg.par_iter_mut()).zip(pb.par_iter_mut()).for_each(|((r, gg), b)| {
+        let l = ((*r + *gg + *b) as f64 / 3.0).max(0.0);
+        let ln = 255.0 * (l / 255.0).powf(g);
+        let mut slope = (l / (255.0 * p)).powf(g - 1.0) * p.powf(g) * g;
+        if !slope.is_finite() {
+            slope = 1.0;
+        }
+        let gk = ((slope - 1.0) * citras() + 1.0) / p;
+        for v in [r, gg, b] {
+            *v = (ln + (*v as f64 - l) * gk).clamp(0.0, 255.0) as f32;
+        }
+    });
+}
+
+/// Separable float convolution with edge replication, normalised by the sum of the taps.
+fn conv_sep_f(src: &[f32], w: usize, h: usize, co: &[f32]) -> Vec<f32> {
+    let l = (co.len() - 1) / 2;
+    let norm = 1.0 / co.iter().sum::<f32>();
+    let mut tmp = vec![0f32; w * h];
+    tmp.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let s = &src[y * w..(y + 1) * w];
+        for x in 0..w {
+            let mut a = 0.0;
+            for (i, &c) in co.iter().enumerate() {
+                a += c * s[(x as isize + i as isize - l as isize).clamp(0, w as isize - 1) as usize];
+            }
+            row[x] = a * norm;
+        }
+    });
+    let mut out = vec![0f32; w * h];
+    out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        for (i, &c) in co.iter().enumerate() {
+            let t = &tmp[(y as isize + i as isize - l as isize).clamp(0, h as isize - 1) as usize * w..][..w];
+            for x in 0..w {
+                row[x] += c * t[x] * norm;
+            }
+        }
+    });
+    out
+}
+
+/// 3x3 `[1 1 1; 1 8 1; 1 1 1] / 16`, edges replicated.
+fn blur_bp_f(src: &[f32], w: usize, h: usize) -> Vec<f32> {
+    let mut o = vec![0f32; w * h];
+    o.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let (ya, yb) = (y.saturating_sub(1), (y + 1).min(h - 1));
+        for x in 0..w {
+            let (xa, xb) = (x.saturating_sub(1), (x + 1).min(w - 1));
+            let s = src[ya * w + xa] + src[ya * w + x] + src[ya * w + xb] + src[y * w + xa] + src[y * w + xb] + src[yb * w + xa] + src[yb * w + x] + src[yb * w + xb];
+            row[x] = (s + 8.0 * src[y * w + x]) * (1.0 / 16.0);
+        }
+    });
+    o
+}
+
+fn noise_filter_hq(f: &mut FPlanes, nv: f64) {
+    let (w, h) = (f.w, f.h);
+    if w < 3 || h < 3 {
+        return;
+    }
+    let x = ((20.0 * nv + 0.5) as i32).min(10) as f32;
+    let m = (10.0 * nv + 0.5) as i32;
+    let a = (0.4 + 2.0 * nv).min(1.5) as f32;
+    let b = (0.2 + 2.0 * nv).min(1.0) as f32;
+    let n = w * h;
+    let mut y: Vec<f32> = (0..n).map(|i| (f.p[0][i] + f.p[1][i] + f.p[2][i]) / 3.0).collect();
+    let c1: Vec<f32> = (0..n).map(|i| (2.0 * f.p[1][i] - f.p[2][i] - f.p[0][i]) / 4.0).collect();
+    let c2: Vec<f32> = (0..n).map(|i| (f.p[2][i] - f.p[0][i]) / 2.0).collect();
+    if nv > 0.25 {
+        y = blur_bp_f(&y, w, h);
+    }
+    let lp3 = conv_sep_f(&y, w, h, &[1.0, 3.0, 1.0]);
+    let lp5 = conv_sep_f(&y, w, h, &[1.0, 4.0, 6.0, 4.0, 1.0]);
+    let core = |d: f32| if d >= x { d - x } else if d < -x { d + x } else { 0.0 };
+    y.par_iter_mut().zip(lp3.par_iter().zip(lp5.par_iter())).for_each(|(v, (&l3, &l5))| {
+        let (h3, h5) = (*v - l3, *v - l5);
+        *v = (*v + core(h3) * a + core(h5) * b).clamp(0.0, 255.0);
+    });
+    let sm = |p: &[f32]| -> Vec<f32> {
+        let p = blur_bp_f(p, w, h);
+        let k: Vec<f32> = match m {
+            i32::MIN..=2 => vec![1.0, 3.0, 1.0],
+            3 => binom_row(3).iter().map(|&v| v as f32).collect(),
+            4 | 5 => binom_row(5).iter().map(|&v| v as f32).collect(),
+            _ => binom_row(9).iter().map(|&v| v as f32).collect(),
+        };
+        conv_sep_f(&p, w, h, &k)
+    };
+    let (u, v) = (sm(&c1), sm(&c2));
+    let [pr, pg, pb] = &mut f.p;
+    pr.par_iter_mut().zip(pg.par_iter_mut()).zip(pb.par_iter_mut()).enumerate().for_each(|(i, ((r, g), bl))| {
+        let t = u[i] * (4.0 / 6.0);
+        *r = (y[i] - t - v[i]).clamp(0.0, 255.0);
+        *g = (y[i] + u[i] * (8.0 / 6.0)).clamp(0.0, 255.0);
+        *bl = (y[i] - t + v[i]).clamp(0.0, 255.0);
+    });
+}
+
+fn black_print_hq(f: &mut FPlanes, m: f64) {
+    let (w, h) = (f.w, f.h);
+    if w < 2 || h < 2 {
+        return;
+    }
+    let lt = ((m * BP_LUMA) as i32).clamp(1, BP_LUMA_MAX as i32) as f32;
+    let ct = ((m * BP_CHROMA) as i32).clamp(1, BP_CHROMA_MAX as i32) as f32;
+    let blur: [Vec<f32>; 3] = std::array::from_fn(|c| blur_bp_f(&f.p[c], w, h));
+    let raw = f.p.clone();
+    let [pr, pg, pb] = &mut f.p;
+    pr.par_chunks_mut(w).zip(pg.par_chunks_mut(w)).zip(pb.par_chunks_mut(w)).enumerate().for_each(|(y, ((r, g), b))| {
+        for x in 0..w {
+            let i = y * w + x;
+            let l = (blur[0][i] + blur[1][i] + blur[2][i]) / 3.0;
+            let wgt = ((lt - l) / (lt * BP_RATIO as f32)).clamp(0.0, 1.0);
+            if wgt == 0.0 {
+                continue;
+            }
+            let e: f32 = (0..3).map(|c| (l - raw[c][i]).abs()).sum();
+            let q = ((ct - e) / (ct * BP_RATIO as f32)).clamp(0.0, 1.0);
+            let i13 = (1.0 - q) * wgt;
+            let s2 = q * l * wgt;
+            for (c, d) in [&mut r[x], &mut g[x], &mut b[x]].into_iter().enumerate() {
+                *d = (raw[c][i] * (1.0 - wgt) + s2 + blur[c][i] * i13).clamp(0.0, 255.0);
+            }
+        }
+    });
+}
+
+/// Mean level (0..255 scale) the integer chain loses per channel against the float one, which the
+/// float path subtracts at the end so that the look (not just the decisions) stays that of the DLL.
+/// Measured as (HQ - exact 8-bit) bias on the four reference frames (variant A): G and B +2.3 on all
+/// four, R +0.1 .. +1.1. It comes from the floors/truncations of the 8-bit Noise Filter's chroma
+/// path (3x3 blur, smoothing passes, `(4u+3)/6`) and the 8-bit Gamma/G&O rounding. Set
+/// `PSI24_HQ_BIAS=0` to get the unbiased float result.
+pub const HQ_BIAS: [f32; 3] = [0.55, 2.3, 2.3];
+
+/// The HQ chain on float planes (0..255 scale): Gain and Offset, Gamma, Noise Filter, Black Print,
+/// with the decisions in `p` ([`hq_params`]).
+pub fn hq_apply(f: &mut FPlanes, p: &HqParams) {
+    go_hq(f, &p.gain);
+    gamma_hq(f, p.gain.p, p.gamma);
+    if std::env::var("PSI24_NO_NF").is_err() {
+        noise_filter_hq(f, p.nv);
+    }
+    if std::env::var("PSI24_NO_BP").is_err() {
+        black_print_hq(f, p.bp_mean);
+    }
+    if std::env::var("PSI24_HQ_BIAS").map(|v| v != "0").unwrap_or(true) {
+        for c in 0..3 {
+            let b = HQ_BIAS[c];
+            f.p[c].par_iter_mut().for_each(|v| *v = (*v - b).max(0.0));
+        }
+    }
 }
 
 #[cfg(test)]
