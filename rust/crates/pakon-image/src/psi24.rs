@@ -61,6 +61,17 @@ pub fn render(rpd: &[Vec<f32>], gamma: Gamma) -> (Array3<u16>, f64) {
     let e8 = std::env::var("PSI24_ROMM12").is_err();
     ebp::set_plain8(e8);
     let corr = std::env::var("PSI24_NO_PRECORR").is_err();
+    if let (Ok(path), true) = (std::env::var("PSI24_DUMP_PREF"), e8) {
+        // unrounded 8-bit-scale sRGB (before the pre-EBP correction), planar f32 LE
+        let mut o = Vec::with_capacity(12 * w * h);
+        for c in 0..3 {
+            for i in 0..w * h {
+                let s = t.romm_srgb.lookup([pl.p[0][i] as f32 / 4095.0, pl.p[1][i] as f32 / 4095.0, pl.p[2][i] as f32 / 4095.0]);
+                o.extend_from_slice(&(s[c] * 255.0).to_le_bytes());
+            }
+        }
+        std::fs::write(path, o).unwrap();
+    }
     if e8 && w > 0 {
         let [pr, pg, pb] = &mut pl.p;
         pr.par_chunks_mut(w).zip(pg.par_chunks_mut(w)).zip(pb.par_chunks_mut(w)).for_each(|((r, g), b)| {
@@ -104,12 +115,16 @@ pub fn render(rpd: &[Vec<f32>], gamma: Gamma) -> (Array3<u16>, f64) {
 
 
 /// Measured difference (real - ours) of the 8-bit sRGB entering EBP, at knots 0, 16, .. 240 per
-/// channel, pooled over the two real frames of `psi24-ebp-stages` (frame 1 alone predicts frame 4's
-/// error: MAE 2.0 -> 0.8). Our `rpd.pf -> romm.pf -> srgb.pf` tables are about 2-4 levels low in the
-/// highlights and 1-3 high in the shadows against the DLL; the cause is not found, this is the fit.
-const PRE_R: [f32; 16] = [2.12, 1.86, 1.29, 1.01, 1.39, 1.75, 1.96, 2.22, 2.41, 3.04, 3.74, 3.83, 3.77, 3.92, 4.09, 4.18];
-const PRE_G: [f32; 16] = [-0.39, -0.50, -0.76, -0.91, -0.50, 0.06, 0.30, 0.67, 1.08, 1.40, 1.86, 2.18, 2.42, 2.70, 2.74, 2.55];
-const PRE_B: [f32; 16] = [-1.59, -1.67, -1.67, -1.46, -1.09, -0.76, -0.48, 0.07, 0.42, 0.69, 1.29, 1.57, 1.67, 1.98, 2.10, 2.02];
+/// channel. Fitted by quantile (histogram) matching of our pre-EBP channel against the real `s0`
+/// dumps, pooled over all four reference frames (the Gain & Offset stage is histogram driven, and
+/// matching the histograms beats a least-squares / per-pixel fit end to end; knot 0 is kept from the
+/// previous fit, too few pixels). The per-frame curves agree to ~0.5 level. Our `rpd.pf -> romm.pf ->
+/// srgb.pf` tables are about 2-4 levels low in the highlights and 1-3 high in the shadows against the
+/// DLL; skipping the 12-bit ROMM round trip changes the output by only 0.02-0.04 levels, so it is not
+/// the cause (see PSI24_RE_NOTES section 5).
+const PRE_R: [f32; 16] = [2.12, 2.24, 1.71, 0.90, 1.29, 2.11, 1.37, 2.90, 2.07, 3.12, 3.60, 3.61, 3.43, 4.16, 4.08, 4.19];
+const PRE_G: [f32; 16] = [-0.39, -0.39, -1.18, -1.01, -0.64, 0.54, -0.04, 0.99, 1.04, 1.22, 1.98, 2.20, 2.19, 2.82, 2.77, 2.47];
+const PRE_B: [f32; 16] = [-1.59, -1.64, -2.00, -1.35, -1.28, -0.29, -0.84, 0.47, 0.40, 0.51, 1.58, 1.56, 1.50, 2.12, 1.99, 1.83];
 
 fn pre_corr(v: f32, k: &[f32; 16], fade: bool) -> f32 {
     let x = (v / 16.0).clamp(0.0, 15.0);
