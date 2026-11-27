@@ -315,7 +315,7 @@ pub fn estimate_gamma(img: &Planes) -> GammaEstimate {
     let n = w * h;
     let t_lo = (mean_lo_pct() * 2.56).ceil();
     let t_hi = (mean_hi_pct() * 2.56).ceil();
-    let l8: Vec<i32> = (0..n).map(|i| if plain8() { (((img.p[0][i] >> 4) as i32 + (img.p[1][i] >> 4) as i32 + (img.p[2][i] >> 4) as i32 + 1) / 3) } else { (((img.p[0][i] as i32 + img.p[1][i] as i32 + img.p[2][i] as i32) + 1) / 3) >> 4 }).collect();
+    let l8: Vec<i32> = (0..n).map(|i| if plain8() { ((img.p[0][i] >> 4) as i32 + (img.p[1][i] >> 4) as i32 + (img.p[2][i] >> 4) as i32 + 1) / 3 } else { (((img.p[0][i] as i32 + img.p[1][i] as i32 + img.p[2][i] as i32) + 1) / 3) >> 4 }).collect();
     let (s5, s5_scale) = if plain8() { (blur_floor(&l8, w, h, &[1, 4, 6, 4, 1], 4), 1.0) } else { (binom5(&l8, w, h), 256.0) };
     let mut hist = [0i64; 256];
     for &s in &s5 {
@@ -463,91 +463,151 @@ pub fn enhanced_black_printing(img: &mut Planes, gamma: Gamma) -> (GainInfo, f64
 }
 
 
-// ImaEBPNoiseFilterOp<uchar> is not decoded. What the real stage dumps (psi24-ebp-stages) show:
-// every channel is smoothed with a 3x3 box, and the luma high-pass (Y - box(Y), Y = mean of
-// RGB) is cored: small detail is scaled down to about half, detail beyond ~15 levels passes
-// through. `NF_*` is the measured mean of (real - box(channel)) against the luma high-pass,
-// pooled over frames 1 and 4 (hp = -24..24, per channel because the stage also carries a small
-// per-channel bias). Fits the real output to MAE 0.7-1.1 (no stage: 2.4-3.4).
-const NF_R: [f32; 49] = [-16.94, -15.90, -14.49, -13.44, -11.84, -11.17, -9.77, -8.98, -7.87, -6.91, -6.25, -5.23, -4.81, -3.97, -3.58, -2.93, -2.50, -2.06, -1.48, -1.23, -0.59, -0.42, 0.15, 0.39, 0.85, 1.32, 1.78, 2.43, 2.73, 3.43, 3.70, 4.38, 4.79, 5.44, 6.19, 6.76, 7.95, 8.74, 10.24, 11.22, 12.88, 14.11, 15.34, 17.15, 18.10, 20.27, 20.97, 23.04, 24.38];
-const NF_G: [f32; 49] = [-18.99, -17.96, -16.52, -15.57, -14.05, -13.39, -12.17, -11.36, -10.31, -9.46, -8.93, -8.04, -7.71, -6.98, -6.73, -6.16, -5.78, -5.38, -4.82, -4.55, -3.85, -3.55, -2.80, -2.39, -1.81, -1.46, -1.20, -0.71, -0.50, 0.14, 0.38, 1.04, 1.45, 2.07, 2.80, 3.36, 4.50, 5.12, 6.61, 7.54, 9.12, 10.30, 11.49, 13.27, 14.18, 16.28, 17.08, 18.96, 20.13];
-const NF_B: [f32; 49] = [-20.57, -19.42, -18.02, -17.00, -15.35, -14.66, -13.28, -12.31, -11.07, -10.01, -9.21, -8.16, -7.60, -6.68, -6.25, -5.56, -5.11, -4.66, -4.09, -3.84, -3.21, -3.02, -2.43, -2.18, -1.71, -1.30, -0.92, -0.33, -0.08, 0.58, 0.82, 1.50, 1.88, 2.52, 3.28, 3.88, 5.10, 5.85, 7.39, 8.49, 10.14, 11.38, 12.66, 14.42, 15.40, 17.53, 18.29, 20.22, 21.35];
+// ImaEBPNoiseFilterOp<uchar>, exec at 0x1016c830, decoded from the DLL (attributes at
+// +0xc4 = 20.0, +0xc8 = 2.0, +0xcc = 10.0) and checked against the stage dumps of four real
+// frames (98.4-99.6 % of samples exact). It is image-adaptive:
+//   1. noise estimate nv = sum((d*d + 32) >> 6) / (n*64 - 64) over the interior, d = the 3x3
+//      Laplacian (8*c - sum of the 8 neighbours) of R - B;
+//   2. luma Y = (R+G+B)/3; if nv > 0.25 Y is first blurred with [1 1 1; 1 8 1; 1 1 1] >> 4;
+//   3. detail hp3 = Y - lp3(Y), hp5 = Y - lp5(Y) (+128, byte): lp3 = [1 3 1]/5 per axis,
+//      lp5 = [1 4 6 4 1] >> 4 per axis, every pass truncated;
+//   4. Y += trunc(core(hp3) * A + .5) + trunc(core(hp5) * B + .5), where core() is a soft
+//      coring with threshold X = min(trunc(20 nv + .5), 10), A = min(.4 + 2 nv, 1.5),
+//      B = min(.2 + 2 nv, 1);
+//   5. chroma C1 = (2G-R-B)/4, C2 = (B-R)/2 (+128) of the unblurred image, blurred with the
+//      same 3x3 kernel, then smoothed by m = trunc(10 nv + .5): m < 3 [1 3 1]/5, 3 -> [1 2 1] >> 2,
+//      4..5 -> [1 4 6 4 1] >> 4, >= 6 -> binomial 9 >> 8 (horizontal then vertical, truncated);
+//   6. R = Y - (4 c1 + 3)/6 - c2, G = Y + (8 c1 + 3)/6, B = Y - (4 c1 + 3)/6 + c2 (C division).
+// Left out: the DLL's first output column/row of the 5-tap filter weighs 12:3:1 instead of
+// 11:4:1 (no measurable effect).
+
+fn conv_sep(src: &[i32], w: usize, h: usize, co: &[i32], norm: impl Fn(i32) -> i32 + Sync) -> Vec<i32> {
+    let k = co.len();
+    let l = (k - 1) / 2;
+    let mut tmp = vec![0i32; w * h];
+    tmp.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let s = &src[y * w..(y + 1) * w];
+        for x in 0..w {
+            let mut acc = 0;
+            for (i, &c) in co.iter().enumerate() {
+                let xx = (x as isize + i as isize - l as isize).clamp(0, w as isize - 1) as usize;
+                acc += c * s[xx];
+            }
+            row[x] = norm(acc);
+        }
+    });
+    let mut out = vec![0i32; w * h];
+    out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            let mut acc = 0;
+            for (i, &c) in co.iter().enumerate() {
+                let yy = (y as isize + i as isize - l as isize).clamp(0, h as isize - 1) as usize;
+                acc += c * tmp[yy * w + x];
+            }
+            row[x] = norm(acc);
+        }
+    });
+    out
+}
+
+fn binom_row(k: usize) -> Vec<i32> {
+    let mut r = vec![1i32];
+    for _ in 1..k {
+        let mut n = vec![1i32; r.len() + 1];
+        for i in 1..r.len() {
+            n[i] = r[i - 1] + r[i];
+        }
+        r = n;
+    }
+    r
+}
+
+/// 3x3 [1 1 1; 1 8 1; 1 1 1] >> 4 (truncating), edges replicated.
+fn blur_bp_trunc(src: &[i32], w: usize, h: usize) -> Vec<i32> {
+    let mut o = vec![0i32; w * h];
+    o.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let (ya, yb) = (y.saturating_sub(1), (y + 1).min(h - 1));
+        for x in 0..w {
+            let (xa, xb) = (x.saturating_sub(1), (x + 1).min(w - 1));
+            let s = src[ya * w + xa] + src[ya * w + x] + src[ya * w + xb] + src[y * w + xa] + src[y * w + xb] + src[yb * w + xa] + src[yb * w + x] + src[yb * w + xb];
+            row[x] = (s + 8 * src[y * w + x]) >> 4;
+        }
+    });
+    o
+}
+
+fn nf_hp(y: &[i32], w: usize, h: usize, k: usize) -> Vec<usize> {
+    let lp = if k == 3 { conv_sep(y, w, h, &[1, 3, 1], |a| a / 5) } else { conv_sep(y, w, h, &[1, 4, 6, 4, 1], |a| a >> 4) };
+    y.iter().zip(&lp).map(|(&a, &b)| ((a - b + 128) & 255) as usize).collect()
+}
+
+fn nf_table(x: i32, gain: f64) -> [i32; 256] {
+    std::array::from_fn(|k| {
+        let d = k as i32 - 128;
+        let v = if d >= x { d - x } else if d < -x { d + x } else { 0 };
+        if v == 0 { 0 } else { (v as f64 * gain + 0.5) as i32 }
+    })
+}
+
+/// The noise estimate `nv` (float32 in the DLL) of an 8-bit planar image.
+pub fn noise_level(r: &[i32], b: &[i32], w: usize, h: usize) -> f32 {
+    let d: Vec<i32> = r.iter().zip(b).map(|(&a, &c)| a - c).collect();
+    let sum: i64 = (1..h - 1)
+        .into_par_iter()
+        .map(|y| {
+            let mut s = 0i64;
+            for x in 1..w - 1 {
+                let i = y * w + x;
+                let nb = d[i - w - 1] + d[i - w] + d[i - w + 1] + d[i - 1] + d[i + 1] + d[i + w - 1] + d[i + w] + d[i + w + 1];
+                let v = 8 * d[i] - nb;
+                s += ((v * v + 32) >> 6) as i64;
+            }
+            s
+        })
+        .sum();
+    (sum as f64 / (((w - 2) * (h - 2)) as f64 * 64.0 - 64.0)) as f32
+}
 
 pub fn noise_filter(img: &mut Planes) {
     let (w, h) = (img.w, img.h);
-    if w < 2 || h < 2 {
+    if w < 3 || h < 3 {
         return;
     }
-    let raw: [Vec<i32>; 3] = std::array::from_fn(|c| img.p[c].iter().map(|&v| ((v as i32 + 8) >> 4).min(255)).collect());
-    let boxed: [Vec<f32>; 3] = std::array::from_fn(|c| {
-        let p = &raw[c];
-        let mut o = vec![0f32; w * h];
-        o.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-            let (ya, yb) = (y.saturating_sub(1), (y + 1).min(h - 1));
-            for x in 0..w {
-                let (xa, xb) = (x.saturating_sub(1), (x + 1).min(w - 1));
-                let s = p[ya * w + xa] + p[ya * w + x] + p[ya * w + xb] + p[y * w + xa] + p[y * w + x] + p[y * w + xb] + p[yb * w + xa] + p[yb * w + x] + p[yb * w + xb];
-                row[x] = s as f32 / 9.0;
-            }
-        });
-        o
-    });
-    let tabs: [&[f32; 49]; 3] = [&NF_R, &NF_G, &NF_B];
-    let f = |c: usize, hp: f32| -> f32 {
-        let t = tabs[c];
-        let x = hp + 24.0;
-        if x <= 0.0 {
-            t[0] + x
-        } else if x >= 48.0 {
-            t[48] + (x - 48.0)
-        } else {
-            let i = x as usize;
-            let fr = x - i as f32;
-            t[i] * (1.0 - fr) + t[i + 1] * fr
+    let raw: [Vec<i32>; 3] = std::array::from_fn(|c| img.p[c].iter().map(|&v| ((v >> 4) as i32).min(255)).collect());
+    let nv = noise_level(&raw[0], &raw[2], w, h) as f64;
+    let x = ((20.0 * nv + 0.5) as i32).min(10);
+    let m = (10.0 * nv + 0.5) as i32;
+    let a = (0.4 + 2.0 * nv).min(1.5);
+    let b = (0.2 + 2.0 * nv).min(1.0);
+    let n = w * h;
+    let mut y: Vec<i32> = (0..n).map(|i| (raw[0][i] + raw[1][i] + raw[2][i]) / 3).collect();
+    let c1: Vec<i32> = (0..n).map(|i| ((2 * raw[1][i] - raw[2][i] - raw[0][i]) / 4 + 128) & 255).collect();
+    let c2: Vec<i32> = (0..n).map(|i| ((raw[2][i] - raw[0][i]) / 2 + 128) & 255).collect();
+    if nv > 0.25 {
+        y = blur_bp_trunc(&y, w, h);
+    }
+    let (h3, h5) = (nf_hp(&y, w, h, 3), nf_hp(&y, w, h, 5));
+    let (ta, tb) = (nf_table(x, a), nf_table(x, b));
+    for i in 0..n {
+        y[i] = (y[i] + ta[h3[i]] + tb[h5[i]]).clamp(0, 255);
+    }
+    let sm = |p: &[i32]| -> Vec<i32> {
+        let p = blur_bp_trunc(p, w, h);
+        match m {
+            i32::MIN..=2 => conv_sep(&p, w, h, &[1, 3, 1], |a| a / 5),
+            3 => conv_sep(&p, w, h, &binom_row(3), |a| a >> 2),
+            4 | 5 => conv_sep(&p, w, h, &binom_row(5), |a| a >> 4),
+            _ => conv_sep(&p, w, h, &binom_row(9), |a| a >> 8),
         }
     };
-    // Luma high-pass and its local activity (5x5 mean of |hp|).
-    let hp: Vec<f32> = (0..w * h).map(|i| (raw[0][i] + raw[1][i] + raw[2][i]) as f32 / 3.0 - (boxed[0][i] + boxed[1][i] + boxed[2][i]) / 3.0).collect();
-    let ahp: Vec<f32> = hp.iter().map(|v| v.abs()).collect();
-    let act: Vec<f32> = {
-        let mut tmp = vec![0f32; w * h];
-        tmp.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-            for x in 0..w {
-                let mut s = 0.0;
-                for k in 0..5 {
-                    s += ahp[y * w + (x + k).saturating_sub(2).min(w - 1)];
-                }
-                row[x] = s / 5.0;
-            }
-        });
-        let mut o = vec![0f32; w * h];
-        o.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-            for x in 0..w {
-                let mut s = 0.0;
-                for k in 0..5 {
-                    s += tmp[(y + k).saturating_sub(2).min(h - 1) * w + x];
-                }
-                row[x] = s / 5.0;
-            }
-        });
-        o
-    };
+    let (c1, c2) = (sm(&c1), sm(&c2));
     let [pr, pg, pb] = &mut img.p;
-    pr.par_chunks_mut(w).zip(pg.par_chunks_mut(w)).zip(pb.par_chunks_mut(w)).enumerate().for_each(|(y, ((r, g), b))| {
-        for x in 0..w {
-            let i = y * w + x;
-            let hpv = hp[i];
-            // The tables carry a per-channel offset that the real stage only shows on textured
-            // content (flat probe patches pass unchanged): odd part always, even part with the
-            // local activity.
-            let wt = (act[i] / 0.3).min(1.0);
-            let dst = [&mut r[x], &mut g[x], &mut b[x]];
-            for (c, d) in dst.into_iter().enumerate() {
-                let (fp, fm) = (f(c, hpv), f(c, -hpv));
-                let delta = 0.5 * (fp - fm) + wt * 0.5 * (fp + fm);
-                *d = ((boxed[c][i] + delta + 0.5).floor().clamp(0.0, 255.0) as u16) << 4;
-            }
-        }
+    pr.par_iter_mut().zip(pg.par_iter_mut()).zip(pb.par_iter_mut()).enumerate().for_each(|(i, ((r, g), bl))| {
+        let (u, v) = (c1[i] - 128, c2[i] - 128);
+        let t = (u * 4 + 3) / 6;
+        *r = ((y[i] - t - v).clamp(0, 255) as u16) << 4;
+        *g = ((y[i] + (u * 8 + 3) / 6).clamp(0, 255) as u16) << 4;
+        *bl = ((y[i] - t + v).clamp(0, 255) as u16) << 4;
     });
 }
 
