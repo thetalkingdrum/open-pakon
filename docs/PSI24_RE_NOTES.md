@@ -122,10 +122,17 @@ Validated with a Windows host that runs the real `PakonIMAu.dll` offline (hooks,
 
 **Black Print.** 3x3 `[1 1 1;1 8 1;1 1 1]/16` blur, M = mean over all samples, lut1/lut2 in Q12. Matches the real stage 99.1 % / 95.8 % exact.
 
-**Noise Filter (`ImaEBPNoiseFilterOp<uchar>`, `0x1016c830`, vtable `0x10284a04`; coring 20, boost 2.0, size 10).** Active, **not decoded**. Ours is an empirical model: per channel `out = box3(c) + F_c(hp)` with `hp = Y - box3(Y)`, Y=(R+G+B)/3, F_c fitted tables (49 entries, hp -24..24); the offset part is weighted by min(1, activity/0.3). This stage is what cuts chroma, so skipping it oversaturates.
+**Noise Filter (`ImaEBPNoiseFilterOp<uchar>`, exec `0x1016c830`, vtable `0x10284a04`; attributes +0xc4 = 20.0, +0xc8 = 2.0, +0xcc = 10.0): decoded.** Ported in `ebp.rs::noise_filter`; 98.4-99.6 % of samples exact against the real s2 -> s3 dumps of four frames (the remaining ~0.5 % sit on strong edges, cause not found). It is image-adaptive:
+1. Noise estimate `nv` (stored as float at struct +0xe4): `sum((d*d+32)>>6) / (n*64-64)` over the interior, d = 3x3 Laplacian (8*c - sum of 8 neighbours) of R - B. Matches the dumped values to ~0.1 % (the exact loop bounds are not pinned down).
+2. Y = (R+G+B)/3; if nv > 0.25, Y is blurred with [1 1 1;1 8 1;1 1 1]>>4 (truncating, edges replicated).
+3. hp3 = Y - lp3(Y) + 128, hp5 = Y - lp5(Y) + 128 (byte): lp3 = [1 3 1]/5 per axis, lp5 = [1 4 6 4 1]>>4 per axis, every pass truncated (`0x10170b90`).
+4. Y' = Y + trunc(core(hp3)*A + .5) + trunc(core(hp5)*B + .5), soft coring core(d) = d-X for d >= X, d+X for d < -X, else 0; X = min(trunc(20 nv + .5), 10), A = min(.4 + 2 nv, 1.5), B = min(.2 + 2 nv, 1).
+5. C1 = (2G-R-B)/4 + 128, C2 = (B-R)/2 + 128 (C division) from the *unblurred* RGB, blurred with the 3x3 kernel of step 2, then smoothed by m = trunc(10 nv + .5): m < 3 [1 3 1]/5, m = 3 binomial 3 >> 2, m 4-5 binomial 5 >> 4, m >= 6 binomial 9 >> 8 (horizontal then vertical, each truncated, edges replicated; `0x101722a0`, `0x101728b0`).
+6. R = Y' - (4 c1 + 3)/6 - c2, G = Y' + (8 c1 + 3)/6, B = Y' - (4 c1 + 3)/6 + c2, clamped (c1, c2 = chroma - 128).
+Real values seen: nv 0.338 / 0.480 / 0.265 / 0.603 on frames 1 / 4 / 2 / 3 (X 7/10/5/10, m 3/5/3/6). Not modelled: the DLL's first column/row of the 5-tap filter weighs 12:3:1 instead of 11:4:1 (no measurable effect). This is what cut chroma; the earlier fitted tables are gone.
 
 **Pre-EBP conversion.** Our `rpd -> romm -> srgb` tables are 2-4 levels low in highlights and 1-3 high in shadows versus the DLL's s0. A fitted per-channel 1D correction is applied (G/B fade over the last 7 levels so the bVar2 branch does not flip). Root cause not found.
 
-**Results vs the DLL with real shifts (same input).** Frame 1 MAE 1.0, frame 2 1.2, frame 3 1.3, frame 4 1.5 (variant A); frame 2 variant B 2.5. Probe suite mean MAE 1.6 (was 12-23). Whole EBP from the real s0: MAE 0.8-0.9.
+**Results vs the DLL with real shifts (same input).** Frame 1 MAE 0.87, frame 2 1.07, frame 3 0.78, frame 4 1.23 (variant A); frame 2 variant B 2.3. Whole EBP from the real s0: MAE 0.5-0.9. Probe suite mean MAE 1.6 (was 12-23). Whole EBP from the real s0: MAE 0.8-0.9.
 
-**Open.** Decode the real Noise Filter; find the table difference behind the pre-EBP correction (currently fitted on one film); probe `P3a_1500_3000` M4 (MAE 9); frame 2 variant B bias.
+**Open.** Refit the pre-EBP correction now that the Noise Filter is exact (it was fitted against the old empirical one); find the table difference behind the pre-EBP correction (currently fitted on one film); probe `P3a_1500_3000` M4 (MAE 9); frame 2 variant B bias.
