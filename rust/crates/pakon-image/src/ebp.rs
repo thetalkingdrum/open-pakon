@@ -923,7 +923,7 @@ fn black_print_hq(f: &mut FPlanes, m: f64) {
 /// loss scale, residual bias]`. The float chain is *unbiased*; the DLL's integer chain is not (floors
 /// and truncations), and its mean loss is modelled stage by stage so the look still matches the DLL.
 /// `PSI24_HQ_BIAS=0` disables the model (pure float).
-pub const HQ_LOSS: [f32; 4] = [0.5, 1.0, 0.75, 0.0];
+pub const HQ_LOSS: [f32; 4] = [0.25, 0.8, 0.825, 0.2];
 
 /// The HQ chain on float planes (0..255 scale): Gain and Offset, Gamma, Noise Filter, Black Print,
 /// with the decisions in `p` ([`hq_params`]).

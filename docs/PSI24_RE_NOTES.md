@@ -181,4 +181,9 @@ LittleCMS rpd -> romm -> srgb pair and the fitted `PRE_R/G/B` (still reachable w
   Pre-EBP s0 against the real dumps shows +0.4..+0.6 bias on frames 2-4 (shadows +0.7..+1.0): a constant -2 (12-bit) on cmm_in
   removes it (frames 2/3/4 MAE 0.65/0.69/0.69 -> 0.61/0.55/0.65, frame 1 prefers 0). Shifts enter exactly as `clip(clip(LUT)+shift)` (scan of a
   scale factor on the shift has a sharp minimum at 1.0). Origin of the ~2 level offset is not known; not applied.
-- HQ_LOSS was tuned against the old tables: on the new ones HQ frames 2/3 show -1.0..-1.4 bias (MAE 1.20/1.22); needs a refit.
+- HQ_LOSS was tuned against the old tables (on the new ones HQ frames 2/3 showed -1.0..-1.4 bias, MAE 1.20/1.22). Refit by
+  coordinate descent on the mean MAE of HQ against our own exact 8-bit path over frames 1-4 + 8 probes (M4): `[0.5,1.0,0.75,0]` ->
+  `[0.25,0.8,0.825,0.2]`, mean MAE 0.889 -> 0.838. Against the real DLL, HQ frames 1/2/3/4 MAE 0.89/1.20/1.22/0.99 -> 0.89/1.00/1.03/1.14
+  (mean 1.075 -> 1.015); probe suite HQ M3/M4 1.22/1.09 -> 1.19/1.09. The surface is flat near the optimum and frames still disagree
+  (frames 2/3, both with the gamma clamped at 0.7, stay -0.6..-1.2 low in G, frame 4 is +0.2..+0.6): a content-dependent loss is
+  left, not a constant one. Fitted on 12 images, no held-out set yet (the second film stock will be one).
