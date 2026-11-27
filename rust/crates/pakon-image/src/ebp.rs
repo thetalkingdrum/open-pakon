@@ -847,8 +847,14 @@ fn noise_filter_hq(f: &mut FPlanes, nv: f64) {
     let b = (0.2 + 2.0 * nv).min(1.0) as f32;
     let n = w * h;
     let mut y: Vec<f32> = (0..n).map(|i| (f.p[0][i] + f.p[1][i] + f.p[2][i]) / 3.0).collect();
-    let c1: Vec<f32> = (0..n).map(|i| (2.0 * f.p[1][i] - f.p[2][i] - f.p[0][i]) / 4.0).collect();
-    let c2: Vec<f32> = (0..n).map(|i| (f.p[2][i] - f.p[0][i]) / 2.0).collect();
+    let mut c1: Vec<f32> = (0..n).map(|i| (2.0 * f.p[1][i] - f.p[2][i] - f.p[0][i]) / 4.0).collect();
+    let mut c2: Vec<f32> = (0..n).map(|i| (f.p[2][i] - f.p[0][i]) / 2.0).collect();
+    let nf2 = hqk(1) != 0.0; // truncation model on (off with PSI24_HQ_BIAS=0)
+    if nf2 {
+        // the DLL's `/4` and `/2` truncate toward zero: chroma is pulled toward 0 by up to 0.375 / 0.25
+        c1.par_iter_mut().for_each(|v| *v -= v.clamp(-1.0, 1.0) * 0.375);
+        c2.par_iter_mut().for_each(|v| *v -= v.clamp(-1.0, 1.0) * 0.25);
+    }
     if nv > 0.25 {
         y = blur_bp_f(&y, w, h);
     }
@@ -880,14 +886,17 @@ fn noise_filter_hq(f: &mut FPlanes, nv: f64) {
         4 | 5 => 15.0 / 32.0,
         _ => 255.0 / 512.0,
     };
-    let y_loss = wt * hqk(1) * (1.0 / 3.0 + if nv > 0.25 { 15.0 / 32.0 } else { 0.0 });
-    let uv_loss = wt * hqk(2) * (15.0 / 32.0 + 2.0 * k_loss);
+    let (k1, k2) = (hqk(1), hqk(2));
+    let y_loss = wt * k1 * (1.0 / 3.0 + if nv > 0.25 { 15.0 / 32.0 } else { 0.0 });
+    let uv_loss = wt * k2 * (15.0 / 32.0 + 2.0 * k_loss);
     let [pr, pg, pb] = &mut f.p;
     pr.par_iter_mut().zip(pg.par_iter_mut()).zip(pb.par_iter_mut()).enumerate().for_each(|(i, ((r, g), bl))| {
         let (yy, uu, vv) = (y[i] - y_loss, u[i] - uv_loss, v[i] - uv_loss);
-        let t = uu * (4.0 / 6.0);
+        // `(4u+3)/6`, `(8u+3)/6` truncate toward zero: +1 for u < 0
+        let sn = if nf2 { (-uu).clamp(0.0, 1.0) * wt } else { 0.0 };
+        let t = uu * (4.0 / 6.0) + sn;
         *r = (yy - t - vv).clamp(0.0, 255.0);
-        *g = (yy + uu * (8.0 / 6.0)).clamp(0.0, 255.0);
+        *g = (yy + uu * (8.0 / 6.0) + sn).clamp(0.0, 255.0);
         *bl = (yy - t + vv).clamp(0.0, 255.0);
     });
 }
@@ -923,9 +932,11 @@ fn black_print_hq(f: &mut FPlanes, m: f64) {
 
 /// Scale factors of the per-stage loss model: `[G&O stage-1 floor, NF luma loss scale, NF chroma
 /// loss scale, residual bias]`. The float chain is *unbiased*; the DLL's integer chain is not (floors
-/// and truncations), and its mean loss is modelled stage by stage so the look still matches the DLL.
-/// `PSI24_HQ_BIAS=0` disables the model (pure float).
-pub const HQ_LOSS: [f32; 4] = [0.25, 0.8, 0.825, 0.2];
+/// and truncations). Review #4 derived the Noise Filter terms from the C code (signed truncation toward
+/// zero of `/4`, `/2`, `(4u+3)/6`, `(8u+3)/6` plus the blur floors), so they are used at full strength
+/// and the two fitted terms are 0: that cut HQ MAE vs the real DLL from 1.29/1.35 to 1.01/1.07 on two
+/// held-out rolls (16 frames). `PSI24_HQ_BIAS=0` disables the model (pure float).
+pub const HQ_LOSS: [f32; 4] = [0.0, 1.0, 1.0, 0.0];
 
 /// The HQ chain on float planes (0..255 scale): Gain and Offset, Gamma, Noise Filter, Black Print,
 /// with the decisions in `p` ([`hq_params`]).

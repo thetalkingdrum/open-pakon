@@ -198,3 +198,19 @@ New roll, 8 frames, real DLL stage dumps (`psi24-film2.zip`). Base 16 frames are
 - Result with auto gamma (exact path, MAE vs real look): frames 3/7/10/11/12/15/17/21 = 0.71/0.80/0.69/1.02/0.46/1.22/1.71/0.85; HQ 1.29/1.12/1.22/1.47/1.06/1.43/1.59/1.07. Before the g1 fix frames 11/15/17/21 were 8.8/1.6/1.6/3.1.
 - No regression on roll 1 (probe suite exact 0.77/0.68, HQ 1.19/1.07).
 - Not reached: `nv <= 0.25` (lowest nv on this roll 0.294); KCDFS shifts only valid for frames 1..25 of a 37-frame roll.
+
+## Review #4 applied (u8 CMM table, analytic HQ Noise Filter loss), checked on two held-out rolls
+
+Data: roll A (`psi24-film2`, 8 frames) and roll B (`psi24-film2b`, 8 frames, different KCDFS LUT/shifts), Base 16. Auto gamma is within 0.01 of the DLL's `+0x60` on all 16 frames (g1 rule above).
+
+| | suite M3/M4 | roll A | roll B |
+|---|---|---|---|
+| exact, type-5 table (before) | 0.77 / 0.68 | 0.932 | 1.008 |
+| exact, u8 table (type 1) | 0.62 / 0.63 | 0.926 | 0.975 |
+| exact, u8 + node-position warp | 0.71 / 0.66 | 0.941 | 1.000 (rejected) |
+| HQ, fitted `HQ_LOSS` | 1.05 / 1.24 | 1.292 | 1.351 |
+| HQ, analytic NF loss, `HQ_LOSS=[0,1,1,0]` | 0.98 / 1.05 | 1.009 | 1.069 |
+
+- Review's claim that the -2 input offset does not exist: not re-verified here; the exact path no longer shows it as a problem after the u8 table.
+- The Kodak transform is not monotonic near black on the neutral axis (the test does not assume it).
+- NF model (from the C code): chroma `/4`, `/2` truncate toward zero (pull toward 0 by 0.375 / 0.25 before the blur); `(4u+3)/6`, `(8u+3)/6` add +1 when u < 0; luma and chroma blur floors at full strength. No fitted constants; the G&O floor and residual bias terms are 0.
