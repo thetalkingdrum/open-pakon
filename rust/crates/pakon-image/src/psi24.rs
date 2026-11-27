@@ -126,6 +126,7 @@ pub fn render_hq_f32(rpd: &[Vec<f32>], gamma: Gamma) -> (Vec<Vec<f32>>, usize, u
         return (vec![], 0, h, 1.0);
     }
     let corr = std::env::var("PSI24_NO_PRECORR").is_err();
+    let (sr, sg, sb) = (smooth_pre(&PRE_R), smooth_pre(&PRE_G), smooth_pre(&PRE_B));
     let mut f = FPlanes { w, h, p: std::array::from_fn(|_| vec![0f32; w * h]) };
     let mut q8 = Planes::new(w, h);
     {
@@ -144,9 +145,9 @@ pub fn render_hq_f32(rpd: &[Vec<f32>], gamma: Gamma) -> (Vec<Vec<f32>>, usize, u
                 qb[x] = ((b8 + 0.5).clamp(0.0, 255.0) as u16) << 4;
                 // HQ path: no 12-bit round trip, continuous correction, no rounding
                 let s = t.romm_srgb.lookup(rm);
-                fr[x] = c8(s[0], &PRE_R, false).clamp(0.0, 255.0);
-                fg[x] = c8(s[1], &PRE_G, true).clamp(0.0, 255.0);
-                fb[x] = c8(s[2], &PRE_B, true).clamp(0.0, 255.0);
+                fr[x] = c8(s[0], &sr, false).clamp(0.0, 255.0);
+                fg[x] = c8(s[1], &sg, true).clamp(0.0, 255.0);
+                fb[x] = c8(s[2], &sb, true).clamp(0.0, 255.0);
             }
         });
     }
@@ -193,6 +194,19 @@ pub fn render_hq(rpd: &[Vec<f32>], gamma: Gamma) -> (Array3<u16>, f64) {
 const PRE_R: [f32; 16] = [2.12, 2.24, 1.71, 0.90, 1.29, 2.11, 1.37, 2.90, 2.07, 3.12, 3.60, 3.61, 3.43, 4.16, 4.08, 4.19];
 const PRE_G: [f32; 16] = [-0.39, -0.39, -1.18, -1.01, -0.64, 0.54, -0.04, 0.99, 1.04, 1.22, 1.98, 2.20, 2.19, 2.82, 2.77, 2.47];
 const PRE_B: [f32; 16] = [-1.59, -1.64, -2.00, -1.35, -1.28, -0.29, -0.84, 0.47, 0.40, 0.51, 1.58, 1.56, 1.50, 2.12, 1.99, 1.83];
+
+/// `[1 6 1] / 8` smoothing of a PRE table (end knots kept): the fitted tables have a sawtooth
+/// (histogram quantile matching on a discrete 16-level grid) that the HQ path does not need to follow.
+fn smooth_pre(k: &[f32; 16]) -> [f32; 16] {
+    if std::env::var("PSI24_HQ_NOSMOOTH").is_ok() {
+        return *k;
+    }
+    let mut o = *k;
+    for i in 1..15 {
+        o[i] = (k[i - 1] + 6.0 * k[i] + k[i + 1]) * 0.125;
+    }
+    o
+}
 
 fn pre_corr(v: f32, k: &[f32; 16], fade: bool) -> f32 {
     let x = (v / 16.0).clamp(0.0, 15.0);

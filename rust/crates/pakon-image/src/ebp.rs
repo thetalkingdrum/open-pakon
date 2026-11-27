@@ -745,9 +745,25 @@ fn go_hq(f: &mut FPlanes, gi: &GainInfo) {
                     }
                 }
             };
-            *v = (y / 16.0).clamp(0.0, 255.0) as f32;
+            // the DLL's stage-1-only LUT floors; the knee LUT rounds (+0.5), no loss there
+            *v = (y / 16.0 - if gi.knee.is_none() { hqk(0) as f64 } else { 0.0 }).clamp(0.0, 255.0) as f32;
         });
     }
+}
+
+/// Tunable loss-model constants (see [`HQ_LOSS`]); `PSI24_HQ_K=a,b,c,d` overrides them for fitting.
+fn hqk(i: usize) -> f32 {
+    use std::sync::OnceLock;
+    static K: OnceLock<[f32; 4]> = OnceLock::new();
+    K.get_or_init(|| {
+        let mut k = if std::env::var("PSI24_HQ_BIAS").map(|v| v == "0").unwrap_or(false) { [0.0; 4] } else { HQ_LOSS };
+        if let Ok(v) = std::env::var("PSI24_HQ_K") {
+            for (d, t) in k.iter_mut().zip(v.split(',')) {
+                *d = t.parse().unwrap_or(*d);
+            }
+        }
+        k
+    })[i]
 }
 
 fn gamma_hq(f: &mut FPlanes, p: f64, g: f64) {
@@ -843,12 +859,25 @@ fn noise_filter_hq(f: &mut FPlanes, nv: f64) {
         conv_sep_f(&p, w, h, &k)
     };
     let (u, v) = (sm(&c1), sm(&c2));
+    // Mean floor/truncation loss of the integer chain, only where it has texture to truncate
+    // (flat patches lose nothing): luma (`/3`, optional 3x3 blur), chroma (3x3 blur + the
+    // smoothing passes, two floors of `k_loss` each plus the 3x3 blur's own).
+    let wt = ((nv / 0.1).min(1.0)) as f32;
+    let k_loss = match m {
+        i32::MIN..=2 => 0.4,
+        3 => 3.0 / 8.0,
+        4 | 5 => 15.0 / 32.0,
+        _ => 255.0 / 512.0,
+    };
+    let y_loss = wt * hqk(1) * (1.0 / 3.0 + if nv > 0.25 { 15.0 / 32.0 } else { 0.0 });
+    let uv_loss = wt * hqk(2) * (15.0 / 32.0 + 2.0 * k_loss);
     let [pr, pg, pb] = &mut f.p;
     pr.par_iter_mut().zip(pg.par_iter_mut()).zip(pb.par_iter_mut()).enumerate().for_each(|(i, ((r, g), bl))| {
-        let t = u[i] * (4.0 / 6.0);
-        *r = (y[i] - t - v[i]).clamp(0.0, 255.0);
-        *g = (y[i] + u[i] * (8.0 / 6.0)).clamp(0.0, 255.0);
-        *bl = (y[i] - t + v[i]).clamp(0.0, 255.0);
+        let (yy, uu, vv) = (y[i] - y_loss, u[i] - uv_loss, v[i] - uv_loss);
+        let t = uu * (4.0 / 6.0);
+        *r = (yy - t - vv).clamp(0.0, 255.0);
+        *g = (yy + uu * (8.0 / 6.0)).clamp(0.0, 255.0);
+        *bl = (yy - t + vv).clamp(0.0, 255.0);
     });
 }
 
@@ -881,13 +910,11 @@ fn black_print_hq(f: &mut FPlanes, m: f64) {
     });
 }
 
-/// Mean level (0..255 scale) the integer chain loses per channel against the float one, which the
-/// float path subtracts at the end so that the look (not just the decisions) stays that of the DLL.
-/// Measured as (HQ - exact 8-bit) bias on the four reference frames (variant A): G and B +2.3 on all
-/// four, R +0.1 .. +1.1. It comes from the floors/truncations of the 8-bit Noise Filter's chroma
-/// path (3x3 blur, smoothing passes, `(4u+3)/6`) and the 8-bit Gamma/G&O rounding. Set
-/// `PSI24_HQ_BIAS=0` to get the unbiased float result.
-pub const HQ_BIAS: [f32; 3] = [0.55, 2.3, 2.3];
+/// Scale factors of the per-stage loss model: `[G&O stage-1 floor, NF luma loss scale, NF chroma
+/// loss scale, residual bias]`. The float chain is *unbiased*; the DLL's integer chain is not (floors
+/// and truncations), and its mean loss is modelled stage by stage so the look still matches the DLL.
+/// `PSI24_HQ_BIAS=0` disables the model (pure float).
+pub const HQ_LOSS: [f32; 4] = [0.5, 1.0, 0.75, 0.0];
 
 /// The HQ chain on float planes (0..255 scale): Gain and Offset, Gamma, Noise Filter, Black Print,
 /// with the decisions in `p` ([`hq_params`]).
@@ -900,10 +927,10 @@ pub fn hq_apply(f: &mut FPlanes, p: &HqParams) {
     if std::env::var("PSI24_NO_BP").is_err() {
         black_print_hq(f, p.bp_mean);
     }
-    if std::env::var("PSI24_HQ_BIAS").map(|v| v != "0").unwrap_or(true) {
+    let r = hqk(3);
+    if r != 0.0 {
         for c in 0..3 {
-            let b = HQ_BIAS[c];
-            f.p[c].par_iter_mut().for_each(|v| *v = (*v - b).max(0.0));
+            f.p[c].par_iter_mut().for_each(|v| *v = (*v - r).max(0.0));
         }
     }
 }
