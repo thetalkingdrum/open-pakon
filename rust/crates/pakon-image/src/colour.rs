@@ -160,7 +160,16 @@ impl Table {
         }
         let at = |d: [usize; 3]| 3 * (((i[0] + d[0]) * n + i[1] + d[1]) * n + i[2] + d[2]);
         let mut ord = [0usize, 1, 2];
-        ord.sort_by(|&a, &b| fr[b].partial_cmp(&fr[a]).unwrap());
+        // sort the three fractions descending with compare-and-swaps (no NaN panic, no slice sort per pixel)
+        if !(fr[ord[0]] >= fr[ord[1]]) {
+            ord.swap(0, 1);
+        }
+        if !(fr[ord[1]] >= fr[ord[2]]) {
+            ord.swap(1, 2);
+        }
+        if !(fr[ord[0]] >= fr[ord[1]]) {
+            ord.swap(0, 1);
+        }
         let mut d = [0usize; 3];
         let mut e = at(d);
         let mut acc = [0f64; 3];
