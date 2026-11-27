@@ -315,7 +315,7 @@ pub fn estimate_gamma(img: &Planes) -> GammaEstimate {
     let n = w * h;
     let t_lo = (mean_lo_pct() * 2.56).ceil();
     let t_hi = (mean_hi_pct() * 2.56).ceil();
-    let l8: Vec<i32> = (0..n).map(|i| (((img.p[0][i] as i32 + img.p[1][i] as i32 + img.p[2][i] as i32) + 1) / 3) >> 4).collect();
+    let l8: Vec<i32> = (0..n).map(|i| if plain8() { (((img.p[0][i] >> 4) as i32 + (img.p[1][i] >> 4) as i32 + (img.p[2][i] >> 4) as i32 + 1) / 3) } else { (((img.p[0][i] as i32 + img.p[1][i] as i32 + img.p[2][i] as i32) + 1) / 3) >> 4 }).collect();
     let (s5, s5_scale) = if plain8() { (blur_floor(&l8, w, h, &[1, 4, 6, 4, 1], 4), 1.0) } else { (binom5(&l8, w, h), 256.0) };
     let mut hist = [0i64; 256];
     for &s in &s5 {

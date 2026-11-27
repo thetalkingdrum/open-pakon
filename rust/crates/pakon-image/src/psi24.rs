@@ -150,6 +150,8 @@ mod tests {
         let (o, g) = render(&rpd, Gamma::Fixed(1.0));
         assert_eq!(o.dim(), (30, 40, 3));
         assert!(g == 1.0);
-        assert!(o.iter().all(|&v| v == o[(0, 0, 0)] || true));
+        for c in 0..3 {
+            assert!(o.indexed_iter().all(|((_, _, k), &v)| k != c || v == o[(0, 0, c)]), "channel {c} not flat");
+        }
     }
 }
