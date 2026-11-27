@@ -23,10 +23,35 @@ pub const ROMM_SRGB_U16: &[u8] = include_bytes!("../assets/romm.kodaksrgb65.u16"
 /// the fitted `PRE_R/G/B`: against the real s0 it is MAE 0.19/0.27/0.31 (the pair was 1.75/1.18/1.08).
 pub const CMM65_U16: &[u8] = include_bytes!("../assets/cmm65.u16");
 
+/// The same grid with `SpEvaluate` output type 1 (u8, what the DLL's render uses; stored as u8*257 so
+/// `Table::from_u16_le` gives u8/255). Type 5 lifts the shadows by +0.5..+0.9 u8 levels against it
+/// (review #4), so the exact 8-bit path and the 8-bit decisions of the HQ path use this one.
+pub const CMM65_U8: &[u8] = include_bytes!("../assets/cmm65_u8.u16");
+
 pub struct Tables {
     pub rpd_romm: Table,
     pub romm_srgb: Table,
     pub cmm: Table,
+    pub cmm8: Table,
+}
+
+/// 12-bit value -> table coordinate. The grid nodes are at `round(i*4095/64)`; warping the input to those
+/// exact node positions was tried (review #4) and was worse on both held-out rolls (0.975 -> 1.000 exact MAE,
+/// suite 0.62 -> 0.71), so the uniform coordinate stays.
+#[inline]
+fn node_x(v: f32) -> f32 {
+    v / 4095.0
+}
+
+#[inline]
+fn cmm_at(tab: &Table, row: &[f32], x: usize) -> [f32; 3] {
+    tab.lookup([node_x(row[3 * x]), node_x(row[3 * x + 1]), node_x(row[3 * x + 2])])
+}
+
+/// `PSI24_CMM_T5=1`: use the type-5 table for the 8-bit path too (A/B only).
+fn cmm_t5() -> bool {
+    static O: OnceLock<bool> = OnceLock::new();
+    *O.get_or_init(|| std::env::var("PSI24_CMM_T5").is_ok())
 }
 
 /// `PSI24_OLD_TABLES=1` goes back to the LittleCMS pair + `PRE_R/G/B` (A/B comparisons only).
@@ -41,6 +66,7 @@ pub fn tables() -> &'static Tables {
         rpd_romm: Table::from_u16_le(65, RPD24_ROMM_U16).expect("rpd_24.romm65.u16"),
         romm_srgb: Table::from_u16_le(65, ROMM_SRGB_U16).expect("romm.kodaksrgb65.u16"),
         cmm: Table::from_u16_le(65, CMM65_U16).expect("cmm65.u16"),
+        cmm8: Table::from_u16_le(65, CMM65_U8).expect("cmm65_u8.u16"),
     })
 }
 
@@ -71,7 +97,7 @@ pub fn render(rpd: &[Vec<f32>], gamma: Gamma) -> (Array3<u16>, f64) {
             pr.par_chunks_mut(w.max(1)).zip(pg.par_chunks_mut(w.max(1))).zip(pb.par_chunks_mut(w.max(1))).enumerate().for_each(|(y, ((r, g), b))| {
                 let row = &rpd[y];
                 for x in 0..w {
-                    let s = t.cmm.lookup([row[3 * x] / 4095.0, row[3 * x + 1] / 4095.0, row[3 * x + 2] / 4095.0]);
+                    let s = cmm_at(if cmm_t5() { &t.cmm } else { &t.cmm8 }, row, x);
                     r[x] = ((s[0] * 255.0 + 0.5).clamp(0.0, 255.0) as u16) << 4;
                     g[x] = ((s[1] * 255.0 + 0.5).clamp(0.0, 255.0) as u16) << 4;
                     b[x] = ((s[2] * 255.0 + 0.5).clamp(0.0, 255.0) as u16) << 4;
@@ -81,7 +107,7 @@ pub fn render(rpd: &[Vec<f32>], gamma: Gamma) -> (Array3<u16>, f64) {
         if let Some(path) = dump {
             for y in 0..h {
                 for x in 0..w {
-                    let s = t.cmm.lookup([rpd[y][3 * x] / 4095.0, rpd[y][3 * x + 1] / 4095.0, rpd[y][3 * x + 2] / 4095.0]);
+                    let s = cmm_at(&t.cmm8, &rpd[y], x);
                     for c in 0..3 {
                         raw[c * w * h + y * w + x] = s[c] * 255.0;
                     }
@@ -181,11 +207,12 @@ pub fn render_hq_f32(rpd: &[Vec<f32>], gamma: Gamma) -> (Vec<Vec<f32>>, usize, u
             for x in 0..w {
                 if !old {
                     // one sampled Kodak CMM table: exact 8-bit decisions from the rounded value, HQ planes from the float
-                    let s = t.cmm.lookup([row[3 * x] / 4095.0, row[3 * x + 1] / 4095.0, row[3 * x + 2] / 4095.0]);
+                    let s = cmm_at(&t.cmm, row, x);
+                    let s8 = cmm_at(if cmm_t5() { &t.cmm } else { &t.cmm8 }, row, x);
                     let q = |v: f32| ((v * 255.0 + 0.5).clamp(0.0, 255.0) as u16) << 4;
-                    qr[x] = q(s[0]);
-                    qg[x] = q(s[1]);
-                    qb[x] = q(s[2]);
+                    qr[x] = q(s8[0]);
+                    qg[x] = q(s8[1]);
+                    qb[x] = q(s8[2]);
                     fr[x] = (s[0] * 255.0).clamp(0.0, 255.0);
                     fg[x] = (s[1] * 255.0).clamp(0.0, 255.0);
                     fb[x] = (s[2] * 255.0).clamp(0.0, 255.0);
@@ -295,6 +322,20 @@ mod tests {
                 last[c] = s[c];
             }
         }
+    }
+
+    #[test]
+    fn cmm_tables_load_and_agree_on_the_neutral_ramp() {
+        let t = tables();
+        for i in 0..=60 {
+            let x = i as f32 / 60.0 * 3000.0 / 4095.0;
+            let (a, b) = (t.cmm8.lookup([x; 3]), t.cmm.lookup([x; 3]));
+            for c in 0..3 {
+                // type 5 is the same transform at higher precision: within ~1.5 u8 levels of the u8 output
+                assert!((a[c] - b[c]).abs() * 255.0 < 1.5, "ch {c} u8 {} vs t5 {} at {x}", a[c], b[c]);
+            }
+        }
+        assert!(t.cmm8.lookup([0.0; 3]).iter().all(|v| *v * 255.0 < 3.0));
     }
 
     #[test]
