@@ -43,10 +43,11 @@ fn cmm_at(tab: &Table, row: &[f32], x: usize) -> [f32; 3] {
     tab.lookup_tetra([row[3 * x] / 4095.0, row[3 * x + 1] / 4095.0, row[3 * x + 2] / 4095.0])
 }
 
-/// Gamma exponent ceiling of the automatic estimator. At full resolution the
-/// estimate is within ~0.03 of the best fit on the reference frames, but the edge
-/// statistic it uses is resolution dependent (frame 1 estimates 1.19 on a 1/4
-/// subsample), so a preview could overshoot: capped at 1.0.
+/// Gamma exponent ceiling passed to the automatic estimator (`Gamma::Auto { cap }`) by the roll
+/// renderer and the reference test: the estimate is clamped to at most 1.0. The edge statistic the
+/// estimator uses is resolution dependent (frame 1 estimates 1.19 on a 1/4 subsample), so on
+/// downscaled input it can overshoot; at full resolution it is within ~0.03 of the best fit on the
+/// reference frames. Tests that exercise the estimator itself pass 9.0 (effectively uncapped).
 pub const GAMMA_CAP: f64 = 1.0;
 
 /// `v` 0..1 -> the 8-bit level on the 12-bit plane scale (`level << 4`), rounded like the DLL's u8 output.

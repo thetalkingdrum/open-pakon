@@ -393,12 +393,13 @@ pub fn enhanced_black_printing(img: &mut Planes, gamma: Gamma) -> (GainInfo, f64
 
 // ImaEBPNoiseFilterOp<uchar>, exec at 0x1016c830, decoded from the DLL (attributes at
 // +0xc4 = 20.0, +0xc8 = 2.0, +0xcc = 10.0) and checked against the stage dumps of four real
-// frames (98.4-99.6 % of samples exact). It is image-adaptive:
+// frames (99.9-100 % of samples exact). It is image-adaptive:
 //   1. noise estimate nv = sum((d*d + 32) >> 6) / (n*64 - 64) over the interior, d = the 3x3
 //      Laplacian (8*c - sum of the 8 neighbours) of R - B;
 //   2. luma Y = (R+G+B)/3; if nv > 0.25 Y is first blurred with [1 1 1; 1 8 1; 1 1 1] >> 4;
-//   3. detail hp3 = Y - lp3(Y), hp5 = Y - lp5(Y) (+128, byte): lp3 = [1 3 1]/5 per axis,
-//      lp5 = [1 4 6 4 1] >> 4 per axis, every pass truncated;
+//   3. detail hp3 = Y - lp3(Y), hp5 = Y - lp5(Y) (+128, byte): lp3 = [1 3 1]/5 horizontally and
+//      [1 2 2]/5 over rows (y-1, y, y+1) vertically (the DLL's vertical pass overwrites its row
+//      buffer before reloading it), lp5 = [1 4 6 4 1] >> 4 per axis, every pass truncated;
 //   4. Y += trunc(core(hp3) * A + .5) + trunc(core(hp5) * B + .5), where core() is a soft
 //      coring with threshold X = min(trunc(20 nv + .5), 10), A = min(.4 + 2 nv, 1.5),
 //      B = min(.2 + 2 nv, 1);
@@ -556,8 +557,8 @@ const BP_RATIO: f64 = 0.4;
 /// Black Print on 8-bit data held as `v8 << 4`: in pixels darker than a
 /// threshold (about a third of the mean) the colour blends to a 3x3-blurred,
 /// and where the local chroma energy is small to a grey, version. The mean `M`
-/// is taken over all samples of the image (which samples the DLL uses is not
-/// established; it runs the op in 70 strips).
+/// is the global mean over all samples of the whole image (the DLL runs the op in
+/// 70 strips but takes the mean of the whole image); 100.00 % bit-exact on 8 Base-16 frames.
 pub fn black_print(img: &mut Planes) {
     let (w, h) = (img.w, img.h);
     if w < 2 || h < 2 {

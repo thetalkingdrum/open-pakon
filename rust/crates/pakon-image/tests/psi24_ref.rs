@@ -5,8 +5,9 @@
 use pakon_image::{ebp::Gamma, psi24};
 
 const SH: [[f32; 3]; 4] = [[714.0, 312.0, -101.0], [562.0, 162.0, -236.0], [796.0, 405.0, 3.0], [810.0, 434.0, 45.0]];
-// Measured: 3.34 4.62 5.85 5.09 (mean over R, G, B, 8-bit levels).
-const MAX_MAE: [f64; 4] = [4.0, 5.2, 6.4, 5.7];
+// Measured with the Kodak CMM + EBP render: 0.694 0.737 1.218 1.209 (mean over R, G, B, 8-bit levels),
+// plus a modest margin.
+const MAX_MAE: [f64; 4] = [0.85, 0.9, 1.4, 1.4];
 
 fn u16s(p: &str) -> Vec<u16> {
     std::fs::read(p).unwrap().chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect()

@@ -940,9 +940,9 @@ impl Renderer {
                 Some(a) if a.saturation != 0 || a.tone != Tone::None => Some(self.table_for(&o.table, &self.profiles.join(self.rpd_profile_name), a)?),
                 _ => None,
             };
-            // PSI 2.4 colour: RPD -> ROMM12 -> EnhancedBlackPrinting -> sRGB (the
-            // saturation / tone profiles act on the RPD table, so they keep the
-            // table path).
+            // PSI 2.4 colour: the Kodak CMM (a sampled 65^3 RPD -> sRGB table) then the
+            // 8-bit EBP stages (the saturation / tone profiles act on the RPD table, so
+            // they keep the table path).
             let ebp = self.engine == ColorEngine::Psi24 && !grey && t.is_none();
             let out = if ebp {
                 let field = colour::rpd_field(part, &o.negmat, &o.lut, self.scp_luts.as_deref(), bal.as_ref(), adj);
