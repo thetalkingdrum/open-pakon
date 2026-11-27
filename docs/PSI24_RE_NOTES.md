@@ -162,3 +162,23 @@ Opt-in; the bit-exact 8-bit `psi24::render` is unchanged and stays the validatio
 - **Gain & Offset `lo2`** window is centred, `h2[b-1] + h2[b] + h2[b+1]` (the trailing window was a port bug); G&O is now 100 % exact on frames 2 and 3, 99.9 % on frame 4, 98.6 % on frame 1.
 - Whole EBP from the real s0: MAE 0.13 / 0.16 / 0.20 / 0.17 (frames 1, 4, 2, 3), 82-89 % exact, bias ~0. Probe suite M3 1.53, M4 1.39.
 - Open: the HQ `HQ_LOSS` G&O floor term (0.5). The DLL rounds in stage 1 as well, so the term looks wrong in principle, but removing it makes HQ frame 4 worse (1.02 -> 1.39) and the probe suite M3 better (1.68 -> 1.54); refit after the CMM tables are replaced.
+
+## The pre-EBP colour step is now the sampled Kodak CMM (Task 4)
+
+The Windows harness (`psi24-cmm`) calls the DLL's own `SpCombineXforms(rpd.pf, srgb.pf)` + `SpEvaluate` on our grids
+(cross-check: all 3440 s0 pairs from the grid capture reproduced exactly). `SpEvaluate` output types: 1 = u8, 4 = u16 12-bit
+range, 5 = u16 full range (0, 2, 3, 7, 8 rejected). Type 5 on a 65^3 grid (input `round(i*4095/64)`) is stored as
+`assets/cmm65.u16` (R-major) and used as the single cmm_in -> sRGB table (`psi24::Tables::cmm`), replacing the
+LittleCMS rpd -> romm -> srgb pair and the fitted `PRE_R/G/B` (still reachable with `PSI24_OLD_TABLES=1`).
+- On the 3440 exact `cmm_in` -> `s0` pairs: MAE 0.19/0.27/0.31 (old pair 1.75/1.18/1.08), 83-89 % exact after rounding,
+  bias +0.08/+0.09/+0.19 (old -1.47/-0.05/+0.32).
+- Interpolation: trilinear and tetrahedral from the 65^3 grid agree to <0.1 u8 level in range (max 0.32); along 1-D ramps the
+  worst case is 1.3 levels (at the steep clip knee). The DLL's own interpolation is not known.
+- The transform clips hard (grey reaches 255 near input 2600), with gamut clipping to 0: 65 nodes are poor only across those kinks.
+- The u8 output is not `round(u16/257)` (92 % match); we use the 16-bit table and round once.
+- Probe suite (21 probes) M3/M4 mean MAE: 1.53/1.39 -> 0.77/0.70 (P3a_1500_3000 M4 9.66 -> 1.17). HQ: 1.68/1.65 -> 1.22/1.09.
+- Real frames end to end (variant A, exact path) MAE 1 / 2 / 3 / 4: 0.75 / 0.86 / 0.57 / 0.94 -> 0.60 / 0.64 / 0.66 / 1.00.
+  Pre-EBP s0 against the real dumps shows +0.4..+0.6 bias on frames 2-4 (shadows +0.7..+1.0): a constant -2 (12-bit) on cmm_in
+  removes it (frames 2/3/4 MAE 0.65/0.69/0.69 -> 0.61/0.55/0.65, frame 1 prefers 0). Shifts enter exactly as `clip(clip(LUT)+shift)` (scan of a
+  scale factor on the shift has a sharp minimum at 1.0). Origin of the ~2 level offset is not known; not applied.
+- HQ_LOSS was tuned against the old tables: on the new ones HQ frames 2/3 show -1.0..-1.4 bias (MAE 1.20/1.22); needs a refit.

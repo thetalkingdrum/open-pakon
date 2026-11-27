@@ -17,9 +17,22 @@ pub const RPD24_ROMM_U16: &[u8] = include_bytes!("../assets/rpd_24.romm65.u16");
 /// romm.pf -> Kodak srgb.pf, 65^3 u16.
 pub const ROMM_SRGB_U16: &[u8] = include_bytes!("../assets/romm.kodaksrgb65.u16");
 
+/// The real Kodak CMM, `SpCombineXforms(rpd.pf, srgb.pf)` sampled with `SpEvaluate` (output type 5,
+/// u16 full range) on a 65^3 grid of 12-bit inputs: cmm_in (SCP LUT + shifts) -> sRGB, one table
+/// (`assets/make_psi24_tables.py`, Windows `psi24-cmm`). Replaces the LittleCMS rpd -> romm -> srgb pair and
+/// the fitted `PRE_R/G/B`: against the real s0 it is MAE 0.19/0.27/0.31 (the pair was 1.75/1.18/1.08).
+pub const CMM65_U16: &[u8] = include_bytes!("../assets/cmm65.u16");
+
 pub struct Tables {
     pub rpd_romm: Table,
     pub romm_srgb: Table,
+    pub cmm: Table,
+}
+
+/// `PSI24_OLD_TABLES=1` goes back to the LittleCMS pair + `PRE_R/G/B` (A/B comparisons only).
+fn old_tables() -> bool {
+    static O: OnceLock<bool> = OnceLock::new();
+    *O.get_or_init(|| std::env::var("PSI24_OLD_TABLES").is_ok())
 }
 
 pub fn tables() -> &'static Tables {
@@ -27,6 +40,7 @@ pub fn tables() -> &'static Tables {
     T.get_or_init(|| Tables {
         rpd_romm: Table::from_u16_le(65, RPD24_ROMM_U16).expect("rpd_24.romm65.u16"),
         romm_srgb: Table::from_u16_le(65, ROMM_SRGB_U16).expect("romm.kodaksrgb65.u16"),
+        cmm: Table::from_u16_le(65, CMM65_U16).expect("cmm65.u16"),
     })
 }
 
@@ -44,46 +58,75 @@ pub fn render(rpd: &[Vec<f32>], gamma: Gamma) -> (Array3<u16>, f64) {
     let h = rpd.len();
     let w = if h > 0 { rpd[0].len() / 3 } else { 0 };
     let mut pl = Planes::new(w, h);
-    {
-        let [pr, pg, pb] = &mut pl.p;
-        pr.par_chunks_mut(w.max(1)).zip(pg.par_chunks_mut(w.max(1))).zip(pb.par_chunks_mut(w.max(1))).enumerate().for_each(|(y, ((r, g), b))| {
-            let row = &rpd[y];
-            for x in 0..w {
-                let s = t.rpd_romm.lookup([row[3 * x] / 4095.0, row[3 * x + 1] / 4095.0, row[3 * x + 2] / 4095.0]);
-                r[x] = to12(s[0]);
-                g[x] = to12(s[1]);
-                b[x] = to12(s[2]);
-            }
-        });
-    }
     // The DLL's EBP runs on 8-bit sRGB (see `ebp::set_plain8`): convert first.
     // `PSI24_ROMM12=1` keeps the old 12-bit ROMM path for comparisons.
     let e8 = std::env::var("PSI24_ROMM12").is_err();
     ebp::set_plain8(e8);
-    let corr = std::env::var("PSI24_NO_PRECORR").is_err();
-    if let (Ok(path), true) = (std::env::var("PSI24_DUMP_PREF"), e8) {
-        // unrounded 8-bit-scale sRGB (before the pre-EBP correction), planar f32 LE
-        let mut o = Vec::with_capacity(12 * w * h);
-        for c in 0..3 {
-            for i in 0..w * h {
-                let s = t.romm_srgb.lookup([pl.p[0][i] as f32 / 4095.0, pl.p[1][i] as f32 / 4095.0, pl.p[2][i] as f32 / 4095.0]);
-                o.extend_from_slice(&(s[c] * 255.0).to_le_bytes());
-            }
+    if e8 && !old_tables() {
+        // cmm_in -> sRGB in one step through the sampled Kodak CMM, rounded to 8 bit like the DLL's u8 output
+        let dump = std::env::var("PSI24_DUMP_PREF").ok();
+        let mut raw = if dump.is_some() { vec![0f32; 3 * w * h] } else { Vec::new() };
+        {
+            let [pr, pg, pb] = &mut pl.p;
+            pr.par_chunks_mut(w.max(1)).zip(pg.par_chunks_mut(w.max(1))).zip(pb.par_chunks_mut(w.max(1))).enumerate().for_each(|(y, ((r, g), b))| {
+                let row = &rpd[y];
+                for x in 0..w {
+                    let s = t.cmm.lookup([row[3 * x] / 4095.0, row[3 * x + 1] / 4095.0, row[3 * x + 2] / 4095.0]);
+                    r[x] = ((s[0] * 255.0 + 0.5).clamp(0.0, 255.0) as u16) << 4;
+                    g[x] = ((s[1] * 255.0 + 0.5).clamp(0.0, 255.0) as u16) << 4;
+                    b[x] = ((s[2] * 255.0 + 0.5).clamp(0.0, 255.0) as u16) << 4;
+                }
+            });
         }
-        std::fs::write(path, o).unwrap();
-    }
-    if e8 && w > 0 {
-        let [pr, pg, pb] = &mut pl.p;
-        pr.par_chunks_mut(w).zip(pg.par_chunks_mut(w)).zip(pb.par_chunks_mut(w)).for_each(|((r, g), b)| {
-            for x in 0..w {
-                let s = t.romm_srgb.lookup([r[x] as f32 / 4095.0, g[x] as f32 / 4095.0, b[x] as f32 / 4095.0]);
-                let (r8, g8, b8) = (s[0] * 255.0, s[1] * 255.0, s[2] * 255.0);
-                let k = if corr { 1.0 } else { 0.0 };
-                r[x] = ((r8 + k * pre_corr(r8, &PRE_R, false) + 0.5).clamp(0.0, 255.0) as u16) << 4;
-                g[x] = ((g8 + k * pre_corr(g8, &PRE_G, true) + 0.5).clamp(0.0, 255.0) as u16) << 4;
-                b[x] = ((b8 + k * pre_corr(b8, &PRE_B, true) + 0.5).clamp(0.0, 255.0) as u16) << 4;
+        if let Some(path) = dump {
+            for y in 0..h {
+                for x in 0..w {
+                    let s = t.cmm.lookup([rpd[y][3 * x] / 4095.0, rpd[y][3 * x + 1] / 4095.0, rpd[y][3 * x + 2] / 4095.0]);
+                    for c in 0..3 {
+                        raw[c * w * h + y * w + x] = s[c] * 255.0;
+                    }
+                }
             }
-        });
+            std::fs::write(path, raw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        }
+    } else {
+        {
+            let [pr, pg, pb] = &mut pl.p;
+            pr.par_chunks_mut(w.max(1)).zip(pg.par_chunks_mut(w.max(1))).zip(pb.par_chunks_mut(w.max(1))).enumerate().for_each(|(y, ((r, g), b))| {
+                let row = &rpd[y];
+                for x in 0..w {
+                    let s = t.rpd_romm.lookup([row[3 * x] / 4095.0, row[3 * x + 1] / 4095.0, row[3 * x + 2] / 4095.0]);
+                    r[x] = to12(s[0]);
+                    g[x] = to12(s[1]);
+                    b[x] = to12(s[2]);
+                }
+            });
+        }
+        let corr = std::env::var("PSI24_NO_PRECORR").is_err();
+        if let (Ok(path), true) = (std::env::var("PSI24_DUMP_PREF"), e8) {
+            // unrounded 8-bit-scale sRGB (before the pre-EBP correction), planar f32 LE
+            let mut o = Vec::with_capacity(12 * w * h);
+            for c in 0..3 {
+                for i in 0..w * h {
+                    let s = t.romm_srgb.lookup([pl.p[0][i] as f32 / 4095.0, pl.p[1][i] as f32 / 4095.0, pl.p[2][i] as f32 / 4095.0]);
+                    o.extend_from_slice(&(s[c] * 255.0).to_le_bytes());
+                }
+            }
+            std::fs::write(path, o).unwrap();
+        }
+        if e8 && w > 0 {
+            let [pr, pg, pb] = &mut pl.p;
+            pr.par_chunks_mut(w).zip(pg.par_chunks_mut(w)).zip(pb.par_chunks_mut(w)).for_each(|((r, g), b)| {
+                for x in 0..w {
+                    let s = t.romm_srgb.lookup([r[x] as f32 / 4095.0, g[x] as f32 / 4095.0, b[x] as f32 / 4095.0]);
+                    let (r8, g8, b8) = (s[0] * 255.0, s[1] * 255.0, s[2] * 255.0);
+                    let k = if corr { 1.0 } else { 0.0 };
+                    r[x] = ((r8 + k * pre_corr(r8, &PRE_R, false) + 0.5).clamp(0.0, 255.0) as u16) << 4;
+                    g[x] = ((g8 + k * pre_corr(g8, &PRE_G, true) + 0.5).clamp(0.0, 255.0) as u16) << 4;
+                    b[x] = ((b8 + k * pre_corr(b8, &PRE_B, true) + 0.5).clamp(0.0, 255.0) as u16) << 4;
+                }
+            });
+        }
     }
     if let (Ok(path), true) = (std::env::var("PSI24_DUMP_PRE"), e8) {
         // planar 8-bit sRGB entering EBP (for comparing with the real stage dumps)
@@ -126,6 +169,7 @@ pub fn render_hq_f32(rpd: &[Vec<f32>], gamma: Gamma) -> (Vec<Vec<f32>>, usize, u
         return (vec![], 0, h, 1.0);
     }
     let corr = std::env::var("PSI24_NO_PRECORR").is_err();
+    let old = old_tables();
     let (sr, sg, sb) = (smooth_pre(&PRE_R), smooth_pre(&PRE_G), smooth_pre(&PRE_B));
     let mut f = FPlanes { w, h, p: std::array::from_fn(|_| vec![0f32; w * h]) };
     let mut q8 = Planes::new(w, h);
@@ -135,6 +179,18 @@ pub fn render_hq_f32(rpd: &[Vec<f32>], gamma: Gamma) -> (Vec<Vec<f32>>, usize, u
         fr.par_chunks_mut(w).zip(fg.par_chunks_mut(w)).zip(fb.par_chunks_mut(w)).zip(qr.par_chunks_mut(w).zip(qg.par_chunks_mut(w)).zip(qb.par_chunks_mut(w))).enumerate().for_each(|(y, (((fr, fg), fb), ((qr, qg), qb)))| {
             let row = &rpd[y];
             for x in 0..w {
+                if !old {
+                    // one sampled Kodak CMM table: exact 8-bit decisions from the rounded value, HQ planes from the float
+                    let s = t.cmm.lookup([row[3 * x] / 4095.0, row[3 * x + 1] / 4095.0, row[3 * x + 2] / 4095.0]);
+                    let q = |v: f32| ((v * 255.0 + 0.5).clamp(0.0, 255.0) as u16) << 4;
+                    qr[x] = q(s[0]);
+                    qg[x] = q(s[1]);
+                    qb[x] = q(s[2]);
+                    fr[x] = (s[0] * 255.0).clamp(0.0, 255.0);
+                    fg[x] = (s[1] * 255.0).clamp(0.0, 255.0);
+                    fb[x] = (s[2] * 255.0).clamp(0.0, 255.0);
+                    continue;
+                }
                 let rm = t.rpd_romm.lookup([row[3 * x] / 4095.0, row[3 * x + 1] / 4095.0, row[3 * x + 2] / 4095.0]);
                 // exact statistics path: the 12-bit ROMM round trip, 8-bit rounding (like `render`)
                 let s = t.romm_srgb.lookup([to12(rm[0]) as f32 / 4095.0, to12(rm[1]) as f32 / 4095.0, to12(rm[2]) as f32 / 4095.0]);

@@ -21,3 +21,8 @@ G = np.ascontiguousarray(np.stack(np.meshgrid(g, g, g, indexing="ij"), -1).resha
 for name, a, b in (("rpd_24.romm65.u16", rp, rm), ("romm.kodaksrgb65.u16", rm, ks)):
     t = ic.cms_transform(G, a, b, colorspace="rgb", outcolorspace="rgb", intent=0, outdtype="uint16")
     t.astype("<u2").tofile(name)
+
+# cmm65.u16 is not made here: it is the real Kodak CMM (`SpCombineXforms(rpd.pf, srgb.pf)` + `SpEvaluate`,
+# output type 5 = u16 full range) sampled on a 65^3 grid with input levels round(i*4095/64) by the
+# Windows harness in psi24-cmm (Task 4, `out/C65_u16_type5_16bit.bin`, planar R fastest) and
+# transposed to R-major (r, g, b, channel). Input 12-bit cmm_in (SCP LUT + shifts), output 0..65535.
