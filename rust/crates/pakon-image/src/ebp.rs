@@ -799,6 +799,7 @@ fn hqk(i: usize) -> f32 {
 fn gamma_hq(f: &mut FPlanes, p: f64, g: f64) {
     // thread-local `PLAIN8` is only set on the calling thread: read it before going parallel
     let cit = citras();
+    let shrink = hqk(1) != 0.0;
     let [pr, pg, pb] = &mut f.p;
     pr.par_iter_mut().zip(pg.par_iter_mut()).zip(pb.par_iter_mut()).for_each(|((r, gg), b)| {
         let l = ((*r + *gg + *b) as f64 / 3.0).max(0.0);
@@ -809,7 +810,12 @@ fn gamma_hq(f: &mut FPlanes, p: f64, g: f64) {
         }
         let gk = ((slope - 1.0) * cit + 1.0) / p;
         for v in [r, gg, b] {
-            *v = (ln + (*v as f64 - l) * gk).clamp(0.0, 255.0) as f32;
+            let mut ch = (*v as f64 - l) * gk;
+            if shrink {
+                // the DLL's chroma term truncates toward zero: pulled toward 0 by up to 0.5 (review #5)
+                ch -= 0.5 * ch.clamp(-1.0, 1.0);
+            }
+            *v = (ln + ch).clamp(0.0, 255.0) as f32;
         }
     });
 }
