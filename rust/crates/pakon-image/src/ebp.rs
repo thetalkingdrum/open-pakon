@@ -103,11 +103,6 @@ fn binom3(src: &[i32], w: usize, h: usize) -> Vec<i32> {
 /// by its weight sum with truncation (`>> 4` for [1 4 6 4 1], `>> 2` for
 /// [1 2 1]); reproduces the DLL's dumped histograms bit for bit. Returns 8-bit values.
 fn blur_floor(src: &[i32], w: usize, h: usize, k: &[i32], shift: u32) -> Vec<i32> {
-    blur_shift(src, w, h, k, shift, 0)
-}
-
-/// [`blur_floor`] with `add` added before each pass's shift (`1 << (shift - 1)` rounds).
-fn blur_shift(src: &[i32], w: usize, h: usize, k: &[i32], shift: u32, add: i32) -> Vec<i32> {
     let r = k.len() / 2;
     let mut tmp = vec![0i32; w * h];
     tmp.par_chunks_mut(w).enumerate().for_each(|(y, out)| {
@@ -117,7 +112,7 @@ fn blur_shift(src: &[i32], w: usize, h: usize, k: &[i32], shift: u32, add: i32) 
             for (i, wt) in k.iter().enumerate() {
                 s += wt * row[(x + i).saturating_sub(r).min(w - 1)];
             }
-            out[x] = (s + add) >> shift;
+            out[x] = s >> shift;
         }
     });
     let mut out = vec![0i32; w * h];
@@ -127,7 +122,7 @@ fn blur_shift(src: &[i32], w: usize, h: usize, k: &[i32], shift: u32, add: i32) 
             for (i, wt) in k.iter().enumerate() {
                 s += wt * tmp[((y + i).saturating_sub(r)).min(h - 1) * w + x];
             }
-            o[x] = (s + add) >> shift;
+            o[x] = s >> shift;
         }
     });
     out
@@ -242,7 +237,7 @@ pub fn gain_and_offset(img: &mut Planes) -> GainInfo {
     while acc < cnt2 && b < 255 {
         b += 1;
         if b < 255 {
-            acc = h2[b - 2] + h2[b - 1] + h2[b];
+            acc = h2[b - 1] + h2[b] + h2[b + 1];
         }
     }
     let lo2 = b as i32;
@@ -335,13 +330,12 @@ pub fn estimate_gamma(img: &Planes) -> GammaEstimate {
     let t_lo = (mean_lo_pct() * 2.56).ceil();
     let t_hi = (mean_hi_pct() * 2.56).ceil();
     let l8: Vec<i32> = (0..n).map(|i| if plain8() { ((img.p[0][i] >> 4) as i32 + (img.p[1][i] >> 4) as i32 + (img.p[2][i] >> 4) as i32 + 1) / 3 } else { (((img.p[0][i] as i32 + img.p[1][i] as i32 + img.p[2][i] as i32) + 1) / 3) >> 4 }).collect();
-    // The Gamma estimator's histogram is the luma blurred with ROUNDING passes (unlike the G&O
-    // histogram, which truncates): reproduces the DLL's gamma (struct +0x58) on frames 1, 2 and 4
-    // to 3e-4, truncating is 0.004-0.008 low.
-    let (s5, s5_scale) = if plain8() { (blur_shift(&l8, w, h, &[1, 4, 6, 4, 1], 4, 8), 1.0) } else { (binom5(&l8, w, h), 256.0) };
+    // The DLL runs the luma through 5-tap blurs in Q7 (l8 << 7) and rounds once when binning:
+    // (binom5(l8) + 128) >> 8 (reproduces the DLL's gamma, struct +0x58, on all four frames).
+    let (s5, s5_scale) = (binom5(&l8, w, h), 256.0);
     let mut hist = [0i64; 256];
     for &s in &s5 {
-        hist[if plain8() { s } else { (s + 128) >> 8 }.clamp(0, 255) as usize] += 1;
+        hist[((s + 128) >> 8).clamp(0, 255) as usize] += 1;
     }
     let (mut i, mut seen, mut cnt_lo, mut sum_lo) = (0usize, 0, 0i64, 0i64);
     while i < 255 && seen < 2 {
@@ -376,7 +370,7 @@ pub fn estimate_gamma(img: &Planes) -> GammaEstimate {
         let mean = (tot - sum_lo - sum_hi) as f64 / inner.max(1) as f64;
         let mut g1 = 1.0;
         if mean >= t_lo {
-            let (s3, s3_scale) = if plain8() { (blur_floor(&l8, w, h, &[1, 2, 1], 2), 1.0) } else { (binom3(&l8, w, h), 16.0) };
+            let (s3, s3_scale) = (binom3(&l8, w, h), 16.0);
             let d = |i: usize| s3[i] as f64 / s3_scale - s5[i] as f64 / s5_scale;
             let ss: f64 = (0..n).into_par_iter().map(|i| d(i) * d(i)).sum();
             let sig = (ss / (n.max(2) - 1) as f64).sqrt();
@@ -659,8 +653,8 @@ pub fn black_print(img: &mut Planes) {
     }
     let raw: [Vec<i32>; 3] = std::array::from_fn(|c| img.p[c].iter().map(|&v| ((v as i32 + 8) >> 4).min(255)).collect());
     let m: f64 = raw.iter().map(|p| p.iter().map(|&v| v as i64).sum::<i64>()).sum::<i64>() as f64 / (3 * w * h) as f64;
-    let lt = ((m * BP_LUMA) as i32).clamp(1, BP_LUMA_MAX as i32) as f64;
-    let ct = ((m * BP_CHROMA) as i32).clamp(1, BP_CHROMA_MAX as i32) as f64;
+    let lt = ((m * BP_LUMA + 0.5) as i32).clamp(1, BP_LUMA_MAX as i32) as f64;
+    let ct = ((m * BP_CHROMA + 0.5) as i32).clamp(1, BP_CHROMA_MAX as i32) as f64;
     let lut1: Vec<i32> = (0..256).map(|v| (((lt - v as f64) * 4096.0 / (lt * BP_RATIO) + 0.5).floor() as i32).clamp(0, 4096)).collect();
     let n2 = (255.0 * 1.5) as usize + 1;
     let lut2: Vec<i32> = (0..n2).map(|v| (((ct - v as f64) * 4096.0 / (ct * BP_RATIO) + 0.5).floor() as i32).clamp(0, 4096)).collect();
@@ -901,8 +895,8 @@ fn black_print_hq(f: &mut FPlanes, m: f64) {
     if w < 2 || h < 2 {
         return;
     }
-    let lt = ((m * BP_LUMA) as i32).clamp(1, BP_LUMA_MAX as i32) as f32;
-    let ct = ((m * BP_CHROMA) as i32).clamp(1, BP_CHROMA_MAX as i32) as f32;
+    let lt = ((m * BP_LUMA + 0.5) as i32).clamp(1, BP_LUMA_MAX as i32) as f32;
+    let ct = ((m * BP_CHROMA + 0.5) as i32).clamp(1, BP_CHROMA_MAX as i32) as f32;
     let blur: [Vec<f32>; 3] = std::array::from_fn(|c| blur_bp_f(&f.p[c], w, h));
     let raw = f.p.clone();
     let [pr, pg, pb] = &mut f.p;

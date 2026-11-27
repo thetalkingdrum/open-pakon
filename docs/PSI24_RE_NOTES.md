@@ -155,3 +155,10 @@ Opt-in; the bit-exact 8-bit `psi24::render` is unchanged and stays the validatio
 - Unit test `psi24::tests::hq_stays_close_to_the_8bit_path_and_has_no_banding`: HQ vs 8-bit MAE/bias on a synthetic gradient, and many more distinct 16-bit codes than the 8-bit path on a smooth row. `PSI24_HQ=1` switches `psi24_probe` / `psi24_ref` to HQ (output quantised to 8 bit for the comparison).
 
 **HQ numbers with the loss model** (MAE, variant A frames 1-4 / frame 2 variant B / probe suite M3, M4): exact 0.83 / 1.10 / 0.74 / 1.12, B 1.87, 1.66 / 1.41; HQ with model 1.06 / 1.11 / 0.95 / 1.64, B 1.81, 1.69 / 1.70; pure float (`PSI24_HQ_BIAS=0`) 1.75 / 1.54 / 1.79 / 3.00, B 1.15, 1.53 / 1.70. Signed bias R,G,B of HQ on variant A frames 1-4: +0.3 +0.3 +0.7 / -0.3 -0.8 -0.4 / -0.3 -0.7 +0.3 / +1.4 +1.3 +1.3 (exact: -0.1 -0.5 -0.4 / -0.7 -0.9 -1.0 / -0.5 -0.5 -0.4 / +1.0 +1.1 +0.8). Frame 4 stays the worst (its G&O `lo` is off by one, see above).
+
+### Exact fixes found by disassembly (Neon review #3), all verified on the stage dumps
+- **Black Print** rounds `LT = round(0.5 M)` and `CT = round(0.25 M)` (`+0.5` before `ftol`, 0x101663ec / 0x1016643a); truncating gave frame 3 only 82 % exact, rounding gives 100 % (frames 1, 3, 4 all 100 %). `M` is summed over all tiles on the x87 stack and never stored in `this`.
+- **Gamma estimator** histogram: luma `<< 7`, 5-tap blurs in Q7, one rounding when binning = `(binom5(l8) + 128) >> 8`; reproduces the DLL's gamma (Gamma struct `+0x58`) on all four frames (frame 3 0.6236).
+- **Gain & Offset `lo2`** window is centred, `h2[b-1] + h2[b] + h2[b+1]` (the trailing window was a port bug); G&O is now 100 % exact on frames 2 and 3, 99.9 % on frame 4, 98.6 % on frame 1.
+- Whole EBP from the real s0: MAE 0.13 / 0.16 / 0.20 / 0.17 (frames 1, 4, 2, 3), 82-89 % exact, bias ~0. Probe suite M3 1.53, M4 1.39.
+- Open: the HQ `HQ_LOSS` G&O floor term (0.5). The DLL rounds in stage 1 as well, so the term looks wrong in principle, but removing it makes HQ frame 4 worse (1.02 -> 1.39) and the probe suite M3 better (1.68 -> 1.54); refit after the CMM tables are replaced.
