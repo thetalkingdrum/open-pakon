@@ -224,7 +224,7 @@ pub fn gain_and_offset(img: &mut Planes) -> GainInfo {
     };
     let s: [f64; 3] = std::array::from_fn(|c| if r2[c] > 0 { 255.0 / r2[c] as f64 } else { 1.0 });
     let off: [i32; 3] = std::array::from_fn(|c| if r2[c] > 0 { lo[c] } else { 0 });
-    let lut8: [Vec<i32>; 3] = std::array::from_fn(|c| (0..256).map(|v| (((v - off[c]) as f64 * s[c]).floor() as i32).clamp(0, 255)).collect());
+    let lut8: [Vec<i32>; 3] = std::array::from_fn(|c| (0..256).map(|v| ((((v - off[c]) as f64 * s[c]) + if plain8() && std::env::var("PSI24_LUT8_FLOOR").is_err() { 0.5 } else { 0.0 }).floor() as i32).clamp(0, 255)).collect());
     // Luma histogram of the stage-1 image (unblurred).
     let mut h2 = [0u64; 256];
     for i in 0..n {
@@ -262,11 +262,27 @@ pub fn gain_and_offset(img: &mut Planes) -> GainInfo {
         let tgt_hi = if bvar2 { (hi2 * 3 + 255) >> 2 } else { (hi2 + 255) / 2 };
         let (l2, h2f, tl, th) = ((lo2 << 4) as f64, (hi2 << 4) as f64, (tgt_lo << 4) as f64, (tgt_hi << 4) as f64);
         k1 = if h2f > l2 { (th - tl) / (h2f - l2) } else { 1.0 };
-        let k2 = if (MAXV as f64) > h2f { (MAXV as f64 - th) / (MAXV as f64 - h2f) } else { 1.0 };
+        // the 8-bit instance tops out at 255 (= 4080 in these units), not at 4095
+        let top = if plain8() { 4080.0 } else { MAXV as f64 };
+        let k2 = if top > h2f { (top - th) / (top - h2f) } else { 1.0 };
         knee = Some([l2, h2f, tl, th, k1, k2]);
         for c in 0..3 {
             luts[c] = (0..=MAXV)
                 .map(|x| {
+                    if plain8() && std::env::var("PSI24_KNEE12").is_err() {
+                        // 8-bit instance (review #5): the knee is computed on the 0..255 scale and rounded once
+                        let (l2, h2, tl, th) = (lo2 as f64, hi2 as f64, tgt_lo as f64, tgt_hi as f64);
+                        let k2 = if 255.0 > h2 { (255.0 - th) / (255.0 - h2) } else { 1.0 };
+                        let y1 = (x as f64 / 16.0 - off[c] as f64) * s[c];
+                        let y = if y1 < l2 {
+                            y1 * if l2 != 0.0 { tl / l2 } else { 1.0 }
+                        } else if y1 <= h2 {
+                            tl + (y1 - l2) * k1
+                        } else {
+                            th + (y1 - h2) * k2
+                        };
+                        return (((y + 0.5).floor().clamp(0.0, 255.0)) as u16) << 4;
+                    }
                     let y1 = (x as f64 - (off[c] << 4) as f64) * s[c];
                     let y = if y1 < l2 {
                         y1 * if l2 != 0.0 { tl / l2 } else { 1.0 }
@@ -299,9 +315,8 @@ const G_LO: f64 = 0.7;
 const G_HI: f64 = 2.0;
 const MEAN_LO_PCT: f64 = 30.07;
 const MEAN_HI_PCT: f64 = 39.84;
-/// Edge pixels are those with |binom3 - binom5| above `EDGE_THR * sigma` (continuous, two-sided; the DLL value
-/// fits g1 on five bright frames of a second roll for k in 0.87..1.02; the old trunc(0.75 sigma) did not).
-const EDGE_THR: f64 = 1.0;
+/// Edge threshold factor (struct +0x38, in Q7 units of the blur difference).
+const EDGE_THR: f64 = 0.75;
 const CITRAS: f64 = 0.6;
 
 /// How Gamma picks its exponent.
@@ -325,7 +340,7 @@ pub struct GammaEstimate {
 /// (mean below 30 %) gets `g2` (pulling the median up), a bright one `g1`
 /// (pulling the mean of the edge pixels to the target), in between a blend.
 /// Narrow histograms (span <= 63.75 bins) give 1. The edge-pixel threshold
-/// scale (`EDGE_THR * sigma`) is reconstructed, not read from the DLL.
+/// scale (`EDGE_THR * sigma`, Q7) is read from the disassembly and reproduces the DLL's g1 exactly.
 pub fn estimate_gamma(img: &Planes) -> GammaEstimate {
     let (w, h) = (img.w, img.h);
     let n = w * h;
@@ -334,7 +349,7 @@ pub fn estimate_gamma(img: &Planes) -> GammaEstimate {
     let l8: Vec<i32> = (0..n).map(|i| if plain8() { ((img.p[0][i] >> 4) as i32 + (img.p[1][i] >> 4) as i32 + (img.p[2][i] >> 4) as i32 + 1) / 3 } else { (((img.p[0][i] as i32 + img.p[1][i] as i32 + img.p[2][i] as i32) + 1) / 3) >> 4 }).collect();
     // The DLL runs the luma through 5-tap blurs in Q7 (l8 << 7) and rounds once when binning:
     // (binom5(l8) + 128) >> 8 (reproduces the DLL's gamma, struct +0x58, on all four frames).
-    let (s5, s5_scale) = (binom5(&l8, w, h), 256.0);
+    let (s5, _s5_scale) = (binom5(&l8, w, h), 256.0);
     let mut hist = [0i64; 256];
     for &s in &s5 {
         hist[((s + 128) >> 8).clamp(0, 255) as usize] += 1;
@@ -372,15 +387,19 @@ pub fn estimate_gamma(img: &Planes) -> GammaEstimate {
         let mean = (tot - sum_lo - sum_hi) as f64 / inner.max(1) as f64;
         let mut g1 = 1.0;
         if mean >= t_lo {
-            let (s3, s3_scale) = (binom3(&l8, w, h), 16.0);
-            let d = |i: usize| s3[i] as f64 / s3_scale - s5[i] as f64 / s5_scale;
-            let ss: f64 = (0..n).into_par_iter().map(|i| d(i) * d(i)).sum();
+            // DLL (0x10181245..0x10181405, review #5): binom5 on l8<<7 (Q7, >>4 per pass) = b5, then binom3 of
+            // b5 (>>2 per pass) = b35; diff = b35 - b5; threshold round(0.75 * sigma) in Q7, two-sided;
+            // the edge mean averages round(b5 / 128), not l8.
+            let q7: Vec<i32> = l8.iter().map(|v| v << 7).collect();
+            let b5 = blur_floor(&q7, w, h, &[1, 4, 6, 4, 1], 4);
+            let b35 = blur_floor(&b5, w, h, &[1, 2, 1], 2);
+            let ss: f64 = (0..n).into_par_iter().map(|i| ((b35[i] - b5[i]) as f64).powi(2)).sum();
             let sig = (ss / (n.max(2) - 1) as f64).sqrt();
-            let thr = sig * EDGE_THR;
+            let thr = (sig * EDGE_THR + 0.5) as i32;
             let (mut sum, mut cnt) = (0f64, 0u64);
             for i in 0..n {
-                if d(i).abs() > thr {
-                    sum += l8[i] as f64;
+                if (b35[i] - b5[i]).abs() > thr {
+                    sum += ((b5[i] + 64) >> 7) as f64;
                     cnt += 1;
                 }
             }
@@ -892,8 +911,8 @@ fn noise_filter_hq(f: &mut FPlanes, nv: f64) {
     let [pr, pg, pb] = &mut f.p;
     pr.par_iter_mut().zip(pg.par_iter_mut()).zip(pb.par_iter_mut()).enumerate().for_each(|(i, ((r, g), bl))| {
         let (yy, uu, vv) = (y[i] - y_loss, u[i] - uv_loss, v[i] - uv_loss);
-        // `(4u+3)/6`, `(8u+3)/6` truncate toward zero: +1 for u < 0
-        let sn = if nf2 { (-uu).clamp(0.0, 1.0) * wt } else { 0.0 };
+        // `(4u+3)/6`, `(8u+3)/6` truncate toward zero: +1 for u < 0 (not weighted by wt: unweighted fits flat patches best, suite HQ 1.07/1.21 -> 0.94/0.97)
+        let sn = if nf2 { (-uu).clamp(0.0, 1.0) } else { 0.0 };
         let t = uu * (4.0 / 6.0) + sn;
         *r = (yy - t - vv).clamp(0.0, 255.0);
         *g = (yy + uu * (8.0 / 6.0) + sn).clamp(0.0, 255.0);
