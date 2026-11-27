@@ -9,7 +9,7 @@ fn main() {
     let rf = std::fs::read(&a[3]).unwrap();
     let mut pl = Planes::new(w, h);
     for c in 0..3 { for i in 0..w * h { pl.p[c][i] = (inp[c * w * h + i] as u16) << 4; } }
-    ebp::set_plain8(true);
+    
     let mut info = String::new();
     match a[2].as_str() {
         "go" => { let g = ebp::gain_and_offset(&mut pl); info = format!("{g:?}"); }

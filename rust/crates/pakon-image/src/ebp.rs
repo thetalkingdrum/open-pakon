@@ -7,39 +7,27 @@
 //! are not ported. The gamma estimator is partly reconstructed (see
 //! [`Gamma::estimate`]).
 
+//! PSI 2.4 EnhancedBlackPrinting (EBP): the four stages the real C-41 path runs on 8-bit sRGB after the
+//! Kodak CMM, decoded from `PakonIMAu.dll` 2.4: Gain and Offset (`ImaEBPGainAndOffsetOp`, per-channel
+//! percentile auto-levels plus a luma knee), Gamma (`ImaEBPGammaOp`, image-adaptive luma gamma), Noise
+//! Filter (`ImaEBPNoiseFilterOp`) and Black Print (`ImaEBPBlackPrintOp`). The constants are the plain
+//! attribute defaults of the DLL's 8-bit (`uchar`) instances (256-bin histograms, 256-entry LUTs).
+//!
+//! The 8-bit stages work on [`Planes`], which stores `level << 4` (a 12-bit-looking plane whose low
+//! four bits are zero between stages). [`hq_params`] / [`hq_apply`] run the same chain on float planes.
+
 use rayon::prelude::*;
 
 const MAXV: usize = 4095;
 
-// The DLL's C-41 EBP runs on 8-bit sRGB data (the `E` template instances: 256-bin
-// histograms, 256-entry LUTs) with the *plain* attribute defaults (probe dump,
-// `PROBE_FINDINGS.md`). We emulate it on the 12-bit machinery by feeding `v8 << 4`
-// and switching the constants with `set_plain8(true)`.
-thread_local! { static PLAIN8: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-/// Per calling thread (the stages read it before they fan out to rayon).
-pub fn set_plain8(on: bool) {
-    PLAIN8.with(|c| c.set(on));
-}
-fn plain8() -> bool {
-    PLAIN8.with(|c| c.get())
-}
-fn black_pct() -> f64 {
-    if plain8() { 0.10 } else { BLACK_PCT }
-}
-fn white_pct() -> f64 {
-    if plain8() { 0.15 } else { WHITE_PCT }
-}
-fn mean_lo_pct() -> f64 {
-    if plain8() { 39.06 } else { MEAN_LO_PCT }
-}
-fn mean_hi_pct() -> f64 {
-    if plain8() { 48.82 } else { MEAN_HI_PCT }
-}
-fn citras() -> f64 {
-    if plain8() { 0.5 } else { CITRAS }
-}
+// Plain attribute defaults of the 8-bit instances (probe dump, `PROBE_FINDINGS.md`).
+const BLACK_PCT: f64 = 0.10;
+const WHITE_PCT: f64 = 0.15;
+const MEAN_LO_PCT: f64 = 39.06;
+const MEAN_HI_PCT: f64 = 48.82;
+const CITRAS: f64 = 0.5;
 
-/// A 12-bit three-plane image.
+/// An 8-bit three-plane image stored as `level << 4`.
 #[derive(Debug, Clone)]
 pub struct Planes {
     pub w: usize,
@@ -51,52 +39,6 @@ impl Planes {
     pub fn new(w: usize, h: usize) -> Planes {
         Planes { w, h, p: std::array::from_fn(|_| vec![0u16; w * h]) }
     }
-}
-
-/// `[1 4 6 4 1]` (x) then (y), edges replicated, unnormalised (sum of
-/// weights 256).
-fn binom5(src: &[i32], w: usize, h: usize) -> Vec<i32> {
-    const K: [i32; 5] = [1, 4, 6, 4, 1];
-    let mut tmp = vec![0i32; w * h];
-    tmp.par_chunks_mut(w).enumerate().for_each(|(y, out)| {
-        let row = &src[y * w..(y + 1) * w];
-        for x in 0..w {
-            let mut s = 0;
-            for (k, wt) in K.iter().enumerate() {
-                s += wt * row[(x + k).saturating_sub(2).min(w - 1)];
-            }
-            out[x] = s;
-        }
-    });
-    let mut out = vec![0i32; w * h];
-    out.par_chunks_mut(w).enumerate().for_each(|(y, o)| {
-        for (k, wt) in K.iter().enumerate() {
-            let r = &tmp[(y + k).saturating_sub(2).min(h - 1) * w..][..w];
-            for x in 0..w {
-                o[x] += wt * r[x];
-            }
-        }
-    });
-    out
-}
-
-/// `[1 2 1]` (x) then (y), edges replicated, unnormalised (sum 16).
-fn binom3(src: &[i32], w: usize, h: usize) -> Vec<i32> {
-    let mut tmp = vec![0i32; w * h];
-    tmp.par_chunks_mut(w).enumerate().for_each(|(y, out)| {
-        let row = &src[y * w..(y + 1) * w];
-        for x in 0..w {
-            out[x] = row[x.saturating_sub(1)] + 2 * row[x] + row[(x + 1).min(w - 1)];
-        }
-    });
-    let mut out = vec![0i32; w * h];
-    out.par_chunks_mut(w).enumerate().for_each(|(y, o)| {
-        let (a, b, c) = (&tmp[y.saturating_sub(1) * w..][..w], &tmp[y * w..][..w], &tmp[(y + 1).min(h - 1) * w..][..w]);
-        for x in 0..w {
-            o[x] = a[x] + 2 * b[x] + c[x];
-        }
-    });
-    out
 }
 
 /// The 8-bit instance's blurs: horizontal pass then vertical pass, each divided
@@ -145,9 +87,7 @@ pub struct GainInfo {
     pub knee: Option<[f64; 6]>,
 }
 
-// Romm12 defaults of ImaEBPGainAndOffsetOp.
-const BLACK_PCT: f64 = 0.08;
-const WHITE_PCT: f64 = 0.10;
+// Further defaults of ImaEBPGainAndOffsetOp.
 const SH_PCT: f64 = 0.06;
 const SHADOW_THR: i32 = 5;
 const HIGHLIGHT_THR: i32 = 250;
@@ -161,18 +101,12 @@ pub fn gain_and_offset(img: &mut Planes) -> GainInfo {
     let mut hist = [[0u64; 256]; 3];
     for c in 0..3 {
         let x8: Vec<i32> = img.p[c].iter().map(|&v| (v >> 4) as i32).collect();
-        if plain8() {
-            for v in blur_floor(&x8, w, h, &[1, 4, 6, 4, 1], 4) {
-                hist[c][v.clamp(0, 255) as usize] += 1;
-            }
-        } else {
-            for s in binom5(&x8, w, h) {
-                hist[c][(s >> 8).clamp(0, 255) as usize] += 1;
-            }
+        for v in blur_floor(&x8, w, h, &[1, 4, 6, 4, 1], 4) {
+            hist[c][v.clamp(0, 255) as usize] += 1;
         }
     }
-    let nb = (n as f64 * black_pct() * 0.01 + 0.5) as u64;
-    let nw = (n as f64 * white_pct() * 0.01 + 0.5) as u64;
+    let nb = (n as f64 * BLACK_PCT * 0.01 + 0.5) as u64;
+    let nw = (n as f64 * WHITE_PCT * 0.01 + 0.5) as u64;
     let mut lo = [0i32; 3];
     let mut hi = [0i32; 3];
     let mut valid = [false; 3];
@@ -224,7 +158,7 @@ pub fn gain_and_offset(img: &mut Planes) -> GainInfo {
     };
     let s: [f64; 3] = std::array::from_fn(|c| if r2[c] > 0 { 255.0 / r2[c] as f64 } else { 1.0 });
     let off: [i32; 3] = std::array::from_fn(|c| if r2[c] > 0 { lo[c] } else { 0 });
-    let lut8: [Vec<i32>; 3] = std::array::from_fn(|c| (0..256).map(|v| ((((v - off[c]) as f64 * s[c]) + if plain8() && std::env::var("PSI24_LUT8_FLOOR").is_err() { 0.5 } else { 0.0 }).floor() as i32).clamp(0, 255)).collect());
+    let lut8: [Vec<i32>; 3] = std::array::from_fn(|c| (0..256).map(|v| ((((v - off[c]) as f64 * s[c]) + 0.5).floor() as i32).clamp(0, 255)).collect());
     // Luma histogram of the stage-1 image (unblurred).
     let mut h2 = [0u64; 256];
     for i in 0..n {
@@ -252,7 +186,7 @@ pub fn gain_and_offset(img: &mut Planes) -> GainInfo {
     let mut k1 = 1.0;
     let mut knee = None;
     let mut luts: [Vec<u16>; 3] = Default::default();
-    let stage1_only = if std::env::var("EBP_OR").is_ok() { lo2 <= SHADOW_THR || HIGHLIGHT_THR <= hi2 } else { lo2 <= SHADOW_THR && HIGHLIGHT_THR <= hi2 } || (hi2 as f64) < lo2 as f64 + 63.75;
+    let stage1_only = (lo2 <= SHADOW_THR && HIGHLIGHT_THR <= hi2) || (hi2 as f64) < lo2 as f64 + 63.75;
     if stage1_only {
         for c in 0..3 {
             luts[c] = (0..=MAXV).map(|x| ((x as f64 - (off[c] << 4) as f64) * s[c]).floor().clamp(0.0, MAXV as f64) as u16).collect();
@@ -263,35 +197,24 @@ pub fn gain_and_offset(img: &mut Planes) -> GainInfo {
         let (l2, h2f, tl, th) = ((lo2 << 4) as f64, (hi2 << 4) as f64, (tgt_lo << 4) as f64, (tgt_hi << 4) as f64);
         k1 = if h2f > l2 { (th - tl) / (h2f - l2) } else { 1.0 };
         // the 8-bit instance tops out at 255 (= 4080 in these units), not at 4095
-        let top = if plain8() { 4080.0 } else { MAXV as f64 };
+        let top = 4080.0;
         let k2 = if top > h2f { (top - th) / (top - h2f) } else { 1.0 };
         knee = Some([l2, h2f, tl, th, k1, k2]);
         for c in 0..3 {
             luts[c] = (0..=MAXV)
                 .map(|x| {
-                    if plain8() && std::env::var("PSI24_KNEE12").is_err() {
-                        // 8-bit instance (review #5): the knee is computed on the 0..255 scale and rounded once
-                        let (l2, h2, tl, th) = (lo2 as f64, hi2 as f64, tgt_lo as f64, tgt_hi as f64);
-                        let k2 = if 255.0 > h2 { (255.0 - th) / (255.0 - h2) } else { 1.0 };
-                        let y1 = (x as f64 / 16.0 - off[c] as f64) * s[c];
-                        let y = if y1 < l2 {
-                            y1 * if l2 != 0.0 { tl / l2 } else { 1.0 }
-                        } else if y1 <= h2 {
-                            tl + (y1 - l2) * k1
-                        } else {
-                            th + (y1 - h2) * k2
-                        };
-                        return (((y + 0.5).floor().clamp(0.0, 255.0)) as u16) << 4;
-                    }
-                    let y1 = (x as f64 - (off[c] << 4) as f64) * s[c];
+                    // the knee is computed on the 0..255 scale and rounded once
+                    let (l2, h2, tl, th) = (lo2 as f64, hi2 as f64, tgt_lo as f64, tgt_hi as f64);
+                    let k2 = if 255.0 > h2 { (255.0 - th) / (255.0 - h2) } else { 1.0 };
+                    let y1 = (x as f64 / 16.0 - off[c] as f64) * s[c];
                     let y = if y1 < l2 {
                         y1 * if l2 != 0.0 { tl / l2 } else { 1.0 }
-                    } else if y1 <= h2f {
+                    } else if y1 <= h2 {
                         tl + (y1 - l2) * k1
                     } else {
-                        th + (y1 - h2f) * k2
+                        th + (y1 - h2) * k2
                     };
-                    (y + 0.5).floor().clamp(0.0, MAXV as f64) as u16
+                    ((y + 0.5).floor().clamp(0.0, 255.0) as u16) << 4
                 })
                 .collect();
         }
@@ -300,24 +223,18 @@ pub fn gain_and_offset(img: &mut Planes) -> GainInfo {
         let l = &luts[c];
         img.p[c].par_iter_mut().for_each(|v| *v = l[(*v as usize).min(MAXV)]);
     }
-    if plain8() {
-        // the DLL's 8-bit instance stores a byte: keep no fractional bits of the 12-bit knee LUT
-        // (otherwise Gamma's `>> 4` truncates them away, a -0.5 bias)
-        for c in 0..3 {
-            img.p[c].par_iter_mut().for_each(|v| *v = (((*v as u32 + 8) >> 4).min(255) << 4) as u16);
-        }
+    // the DLL stores a byte: keep no fractional bits of the 12-bit stage-1 LUT
+    for c in 0..3 {
+        img.p[c].par_iter_mut().for_each(|v| *v = (((*v as u32 + 8) >> 4).min(255) << 4) as u16);
     }
     GainInfo { lo, hi, lo2, hi2, k1, p: k1 * gain_avg, off, s, knee }
 }
 
-// Romm12 defaults of ImaEBPGammaOp.
+// Further defaults of ImaEBPGammaOp.
 const G_LO: f64 = 0.7;
 const G_HI: f64 = 2.0;
-const MEAN_LO_PCT: f64 = 30.07;
-const MEAN_HI_PCT: f64 = 39.84;
 /// Edge threshold factor (struct +0x38, in Q7 units of the blur difference).
 const EDGE_THR: f64 = 0.75;
-const CITRAS: f64 = 0.6;
 
 /// How Gamma picks its exponent.
 #[derive(Debug, Clone, Copy)]
@@ -344,15 +261,18 @@ pub struct GammaEstimate {
 pub fn estimate_gamma(img: &Planes) -> GammaEstimate {
     let (w, h) = (img.w, img.h);
     let n = w * h;
-    let t_lo = (mean_lo_pct() * 2.56).ceil();
-    let t_hi = (mean_hi_pct() * 2.56).ceil();
-    let l8: Vec<i32> = (0..n).map(|i| if plain8() { ((img.p[0][i] >> 4) as i32 + (img.p[1][i] >> 4) as i32 + (img.p[2][i] >> 4) as i32 + 1) / 3 } else { (((img.p[0][i] as i32 + img.p[1][i] as i32 + img.p[2][i] as i32) + 1) / 3) >> 4 }).collect();
-    // The DLL runs the luma through 5-tap blurs in Q7 (l8 << 7) and rounds once when binning:
-    // (binom5(l8) + 128) >> 8 (reproduces the DLL's gamma, struct +0x58, on all four frames).
-    let (s5, _s5_scale) = (binom5(&l8, w, h), 256.0);
+    let t_lo = (MEAN_LO_PCT * 2.56).ceil();
+    let t_hi = (MEAN_HI_PCT * 2.56).ceil();
+    let l8: Vec<i32> = (0..n).map(|i| ((img.p[0][i] >> 4) as i32 + (img.p[1][i] >> 4) as i32 + (img.p[2][i] >> 4) as i32 + 1) / 3).collect();
+    // The DLL runs the luma through 5-tap blurs in Q7 (l8 << 7, `>> 4` per pass) = b5 and rounds once when
+    // binning: (b5 + 64) >> 7 (reproduces the DLL's gamma, struct +0x58, on all frames).
+    let q7: Vec<i32> = l8.iter().map(|v| v << 7).collect();
+    drop(l8);
+    let b5 = blur_floor(&q7, w, h, &[1, 4, 6, 4, 1], 4);
+    drop(q7);
     let mut hist = [0i64; 256];
-    for &s in &s5 {
-        hist[((s + 128) >> 8).clamp(0, 255) as usize] += 1;
+    for &s in &b5 {
+        hist[((s + 64) >> 7).clamp(0, 255) as usize] += 1;
     }
     let (mut i, mut seen, mut cnt_lo, mut sum_lo) = (0usize, 0, 0i64, 0i64);
     while i < 255 && seen < 2 {
@@ -387,11 +307,8 @@ pub fn estimate_gamma(img: &Planes) -> GammaEstimate {
         let mean = (tot - sum_lo - sum_hi) as f64 / inner.max(1) as f64;
         let mut g1 = 1.0;
         if mean >= t_lo {
-            // DLL (0x10181245..0x10181405, review #5): binom5 on l8<<7 (Q7, >>4 per pass) = b5, then binom3 of
-            // b5 (>>2 per pass) = b35; diff = b35 - b5; threshold round(0.75 * sigma) in Q7, two-sided;
-            // the edge mean averages round(b5 / 128), not l8.
-            let q7: Vec<i32> = l8.iter().map(|v| v << 7).collect();
-            let b5 = blur_floor(&q7, w, h, &[1, 4, 6, 4, 1], 4);
+            // DLL (0x10181245..0x10181405): b35 = [1 2 1] blur of b5 (`>> 2` per pass); diff = b35 - b5;
+            // threshold round(0.75 * sigma) in Q7, two-sided; the edge mean averages round(b5 / 128).
             let b35 = blur_floor(&b5, w, h, &[1, 2, 1], 2);
             let ss: u64 = (0..n).into_par_iter().map(|i| { let d = (b35[i] - b5[i]) as i64; (d * d) as u64 }).sum();
             let sig = (ss as f64 / (n.max(2) - 1) as f64).sqrt();
@@ -406,7 +323,7 @@ pub fn estimate_gamma(img: &Planes) -> GammaEstimate {
             if cnt > 0 {
                 let e = sum as f64 / cnt as f64 / 255.0;
                 if e.ln() != 0.0 {
-                    g1 = ((mean_hi_pct() * 0.01 + e) * 0.5).ln() / e.ln();
+                    g1 = ((MEAN_HI_PCT * 0.01 + e) * 0.5).ln() / e.ln();
                 }
             }
         }
@@ -428,20 +345,8 @@ pub fn gamma_correction(img: &mut Planes, p: f64, mode: Gamma) -> f64 {
         Gamma::Fixed(g) => g,
         Gamma::Auto { cap } => estimate_gamma(img).gamma.min(cap),
     };
-    let lut_l: Vec<i32> = (0..=MAXV).map(|i| ((MAXV as f64 * (i as f64 / MAXV as f64).powf(g) + 0.5).floor() as i32).clamp(0, MAXV as i32)).collect();
-    let gain_l: Vec<i32> = (0..=MAXV)
-        .map(|i| {
-            let t = i as f64 / (MAXV as f64 * p);
-            let mut slope = t.powf(g - 1.0) * p.powf(g) * g;
-            if !slope.is_finite() {
-                slope = 1.0;
-            }
-            (((slope - 1.0) * citras() + 1.0) * (1.0 / p) * 4096.0 + 0.5).floor() as i32
-        })
-        .collect();
-    if plain8() {
-        // 8-bit instance: 256-entry tables, chroma term truncated toward zero (checked
-        // against the real stage dumps: 92 % of samples exact, the rest within 1).
+    {
+        // 256-entry tables, chroma term truncated toward zero (checked against the real stage dumps).
         const M8: i32 = 255;
         let lut8: Vec<i32> = (0..=M8).map(|i| ((M8 as f64 * (i as f64 / M8 as f64).powf(g) + 0.5).floor() as i32).clamp(0, M8)).collect();
         let gain8: Vec<i32> = (0..=M8)
@@ -451,7 +356,7 @@ pub fn gamma_correction(img: &mut Planes, p: f64, mode: Gamma) -> f64 {
                 if !slope.is_finite() {
                     slope = 1.0;
                 }
-                (((slope - 1.0) * citras() + 1.0) * (1.0 / p) * 4096.0 + 0.5).floor() as i32
+                (((slope - 1.0) * CITRAS + 1.0) * (1.0 / p) * 4096.0 + 0.5).floor() as i32
             })
             .collect();
         let [pr, pg, pb] = &mut img.p;
@@ -463,17 +368,7 @@ pub fn gamma_correction(img: &mut Planes, p: f64, mode: Gamma) -> f64 {
                 *v = ((ln + ((c - l) * gk) / 4096).clamp(0, M8) as u16) << 4;
             }
         });
-        return g;
     }
-    let [pr, pg, pb] = &mut img.p;
-    (pr, pg, pb).into_par_iter_zip(|r, g_, b| {
-        let l = ((*r as i32 + *g_ as i32 + *b as i32) * 2 + 3) / 6;
-        let (ln, gk) = (lut_l[l as usize], gain_l[l as usize]);
-        for v in [r, g_, b] {
-            let c = *v as i32;
-            *v = (ln + (((c - l) * gk + 0x800) >> 12)).clamp(0, MAXV as i32) as u16;
-        }
-    });
     g
 }
 
@@ -486,16 +381,12 @@ impl ZipThree for (&mut Vec<u16>, &mut Vec<u16>, &mut Vec<u16>) {
     }
 }
 
-/// The whole chain on a ROMM12 image: Gain and Offset, then Gamma.
+/// The whole 8-bit chain: Gain and Offset, Gamma, Noise Filter, Black Print.
 pub fn enhanced_black_printing(img: &mut Planes, gamma: Gamma) -> (GainInfo, f64) {
     let gi = gain_and_offset(img);
     let g = gamma_correction(img, gi.p, gamma);
-    if plain8() && std::env::var("PSI24_NO_NF").is_err() {
-        noise_filter(img);
-    }
-    if plain8() && std::env::var("PSI24_NO_BP").is_err() {
-        black_print(img);
-    }
+    noise_filter(img);
+    black_print(img);
     (gi, g)
 }
 
@@ -742,7 +633,7 @@ pub struct HqParams {
     pub bp_mean: f64,
 }
 
-/// Run the exact 8-bit chain on `q8` (8-bit values held as `v8 << 4`, [`set_plain8`] on) and
+/// Run the exact 8-bit chain on `q8` (8-bit values held as `v8 << 4`) and
 /// record its decisions. `q8` ends up as the exact 8-bit result.
 pub fn hq_params(q8: &mut Planes, gamma: Gamma) -> HqParams {
     let gain = gain_and_offset(q8);
@@ -750,9 +641,7 @@ pub fn hq_params(q8: &mut Planes, gamma: Gamma) -> HqParams {
     let (w, h) = (q8.w, q8.h);
     let raw: [Vec<i32>; 3] = std::array::from_fn(|c| q8.p[c].iter().map(|&v| ((v >> 4) as i32).min(255)).collect());
     let nv = if w >= 3 && h >= 3 { noise_level(&raw[0], &raw[2], w, h) as f64 } else { 0.0 };
-    if std::env::var("PSI24_NO_NF").is_err() {
-        noise_filter(q8);
-    }
+    noise_filter(q8);
     let tot: i64 = q8.p.iter().map(|p| p.iter().map(|&v| ((v as i64 + 8) >> 4).min(255)).sum::<i64>()).sum();
     HqParams { gain, gamma: g, nv, bp_mean: tot as f64 / (3 * w * h).max(1) as f64 }
 }
@@ -775,31 +664,15 @@ fn go_hq(f: &mut FPlanes, gi: &GainInfo) {
                     }
                 }
             };
-            // the DLL's stage-1-only LUT floors; the knee LUT rounds (+0.5), no loss there
-            *v = (y / 16.0 - if gi.knee.is_none() { hqk(0) as f64 } else { 0.0 }).clamp(0.0, 255.0) as f32;
+            // The DLL's stage-1-only LUT floors and the knee LUT rounds; the loss model found no net bias
+            // to correct in either (fitted loss 0), so the curve is applied unbiased.
+            *v = (y / 16.0).clamp(0.0, 255.0) as f32;
         });
     }
 }
 
-/// Tunable loss-model constants (see [`HQ_LOSS`]); `PSI24_HQ_K=a,b,c,d` overrides them for fitting.
-fn hqk(i: usize) -> f32 {
-    use std::sync::OnceLock;
-    static K: OnceLock<[f32; 4]> = OnceLock::new();
-    K.get_or_init(|| {
-        let mut k = if std::env::var("PSI24_HQ_BIAS").map(|v| v == "0").unwrap_or(false) { [0.0; 4] } else { HQ_LOSS };
-        if let Ok(v) = std::env::var("PSI24_HQ_K") {
-            for (d, t) in k.iter_mut().zip(v.split(',')) {
-                *d = t.parse().unwrap_or(*d);
-            }
-        }
-        k
-    })[i]
-}
-
-fn gamma_hq(f: &mut FPlanes, p: f64, g: f64) {
-    // thread-local `PLAIN8` is only set on the calling thread: read it before going parallel
-    let cit = citras();
-    let shrink = hqk(1) != 0.0;
+fn gamma_hq(f: &mut FPlanes, p: f64, g: f64, shrink: bool) {
+    let cit = CITRAS;
     let [pr, pg, pb] = &mut f.p;
     pr.par_iter_mut().zip(pg.par_iter_mut()).zip(pb.par_iter_mut()).for_each(|((r, gg), b)| {
         let l = ((*r + *gg + *b) as f64 / 3.0).max(0.0);
@@ -861,7 +734,7 @@ fn blur_bp_f(src: &[f32], w: usize, h: usize) -> Vec<f32> {
     o
 }
 
-fn noise_filter_hq(f: &mut FPlanes, nv: f64) {
+fn noise_filter_hq(f: &mut FPlanes, nv: f64, loss: bool) {
     let (w, h) = (f.w, f.h);
     if w < 3 || h < 3 {
         return;
@@ -874,8 +747,7 @@ fn noise_filter_hq(f: &mut FPlanes, nv: f64) {
     let mut y: Vec<f32> = (0..n).map(|i| (f.p[0][i] + f.p[1][i] + f.p[2][i]) / 3.0).collect();
     let mut c1: Vec<f32> = (0..n).map(|i| (2.0 * f.p[1][i] - f.p[2][i] - f.p[0][i]) / 4.0).collect();
     let mut c2: Vec<f32> = (0..n).map(|i| (f.p[2][i] - f.p[0][i]) / 2.0).collect();
-    let nf2 = hqk(1) != 0.0; // truncation model on (off with PSI24_HQ_BIAS=0)
-    if nf2 {
+    if loss {
         // the DLL's `/4` and `/2` truncate toward zero: chroma is pulled toward 0 by up to 0.375 / 0.25
         c1.par_iter_mut().for_each(|v| *v -= v.clamp(-1.0, 1.0) * 0.375);
         c2.par_iter_mut().for_each(|v| *v -= v.clamp(-1.0, 1.0) * 0.25);
@@ -911,14 +783,12 @@ fn noise_filter_hq(f: &mut FPlanes, nv: f64) {
         4 | 5 => 15.0 / 32.0,
         _ => 255.0 / 512.0,
     };
-    let (k1, k2) = (hqk(1), hqk(2));
-    let y_loss = wt * k1 * (1.0 / 3.0 + if nv > 0.25 { 15.0 / 32.0 } else { 0.0 });
-    let uv_loss = wt * k2 * (15.0 / 32.0 + 2.0 * k_loss);
+    let (y_loss, uv_loss) = if loss { (wt * (1.0 / 3.0 + if nv > 0.25 { 15.0 / 32.0 } else { 0.0 }), wt * (15.0 / 32.0 + 2.0 * k_loss)) } else { (0.0, 0.0) };
     let [pr, pg, pb] = &mut f.p;
     pr.par_iter_mut().zip(pg.par_iter_mut()).zip(pb.par_iter_mut()).enumerate().for_each(|(i, ((r, g), bl))| {
         let (yy, uu, vv) = (y[i] - y_loss, u[i] - uv_loss, v[i] - uv_loss);
         // `(4u+3)/6`, `(8u+3)/6` truncate toward zero: +1 for u < 0 (not weighted by wt: unweighted fits flat patches best, suite HQ 1.07/1.21 -> 0.94/0.97)
-        let sn = if nf2 { (-uu).clamp(0.0, 1.0) } else { 0.0 };
+        let sn = if loss { (-uu).clamp(0.0, 1.0) } else { 0.0 };
         let t = uu * (4.0 / 6.0) + sn;
         *r = (yy - t - vv).clamp(0.0, 255.0);
         *g = (yy + uu * (8.0 / 6.0) + sn).clamp(0.0, 255.0);
@@ -955,45 +825,43 @@ fn black_print_hq(f: &mut FPlanes, m: f64) {
     });
 }
 
-/// Scale factors of the per-stage loss model: `[G&O stage-1 floor, NF luma loss scale, NF chroma
-/// loss scale, residual bias]`. The float chain is *unbiased*; the DLL's integer chain is not (floors
-/// and truncations). Review #4 derived the Noise Filter terms from the C code (signed truncation toward
-/// zero of `/4`, `/2`, `(4u+3)/6`, `(8u+3)/6` plus the blur floors), so they are used at full strength
-/// and the two fitted terms are 0: that cut HQ MAE vs the real DLL from 1.29/1.35 to 1.01/1.07 on two
-/// held-out rolls (16 frames). `PSI24_HQ_BIAS=0` disables the model (pure float).
-pub const HQ_LOSS: [f32; 4] = [0.0, 1.0, 1.0, 0.0];
+/// Options of the HQ chain.
+#[derive(Debug, Clone, Copy)]
+pub struct HqOptions {
+    /// Model the truncation loss of the DLL's integer chain (default). The float chain is *unbiased*; the
+    /// DLL's is not (floors and truncations in the Noise Filter, Gamma's chroma term). The terms are derived
+    /// from the C code (signed truncation toward zero of `/4`, `/2`, `(4u+3)/6`, `(8u+3)/6`, the blur floors,
+    /// Gamma's chroma term) and applied at full strength; no fitted constants. Off gives the pure float chain.
+    pub loss_model: bool,
+}
+
+impl Default for HqOptions {
+    fn default() -> Self {
+        HqOptions { loss_model: true }
+    }
+}
 
 /// The HQ chain on float planes (0..255 scale): Gain and Offset, Gamma, Noise Filter, Black Print,
 /// with the decisions in `p` ([`hq_params`]).
-pub fn hq_apply(f: &mut FPlanes, p: &HqParams) {
+pub fn hq_apply(f: &mut FPlanes, p: &HqParams, opts: HqOptions) {
     go_hq(f, &p.gain);
-    gamma_hq(f, p.gain.p, p.gamma);
-    if std::env::var("PSI24_NO_NF").is_err() {
-        noise_filter_hq(f, p.nv);
-    }
-    if std::env::var("PSI24_NO_BP").is_err() {
-        black_print_hq(f, p.bp_mean);
-    }
-    let r = hqk(3);
-    if r != 0.0 {
-        for c in 0..3 {
-            f.p[c].par_iter_mut().for_each(|v| *v = (*v - r).max(0.0));
-        }
-    }
+    gamma_hq(f, p.gain.p, p.gamma, opts.loss_model);
+    noise_filter_hq(f, p.nv, opts.loss_model);
+    black_print_hq(f, p.bp_mean);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A smooth gradient with per-channel ranges, `lo..hi` in 12-bit units.
+    /// A smooth gradient with per-channel ranges, `lo..hi` in `level << 4` units.
     fn ramp(w: usize, h: usize, lo: [u16; 3], hi: [u16; 3]) -> Planes {
         let mut p = Planes::new(w, h);
         for c in 0..3 {
             for y in 0..h {
                 for x in 0..w {
                     let t = (x + y * 3) as f64 / (w + 3 * h) as f64;
-                    p.p[c][y * w + x] = (lo[c] as f64 + t * (hi[c] - lo[c]) as f64) as u16;
+                    p.p[c][y * w + x] = ((lo[c] as f64 + t * (hi[c] - lo[c]) as f64) as u16) & !15; // 8-bit levels, `<< 4`
                 }
             }
         }
@@ -1001,10 +869,10 @@ mod tests {
     }
 
     #[test]
-    fn blur_keeps_constants_and_sums_to_256() {
+    fn blur_keeps_constants() {
         let v = vec![7i32; 40 * 30];
-        assert!(binom5(&v, 40, 30).iter().all(|&s| s == 7 * 256));
-        assert!(binom3(&v, 40, 30).iter().all(|&s| s == 7 * 16));
+        assert!(blur_floor(&v, 40, 30, &[1, 4, 6, 4, 1], 4).iter().all(|&s| s == 7));
+        assert!(blur_floor(&v, 40, 30, &[1, 2, 1], 2).iter().all(|&s| s == 7));
     }
 
     #[test]

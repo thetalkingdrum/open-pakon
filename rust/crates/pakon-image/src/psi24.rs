@@ -1,8 +1,7 @@
-//! The PSI 2.4 C-41 render after the scene balance: 12-bit RPD (SCP LUT +
-//! shifts applied, see `colour::rpd_field`) -> `rpd.pf` to `romm.pf` at 12
-//! bit -> EnhancedBlackPrinting (Gain and Offset, Gamma; `ebp`) -> Kodak
-//! `srgb.pf`. The real DLL does exactly this; without the EBP stages the
-//! renders have ~1.3x too much contrast and a shadow toe.
+//! The PSI 2.4 C-41 render after the scene balance: 12-bit RPD (SCP LUT + shifts applied, see
+//! `colour::rpd_field`) -> the Kodak CMM (`rpd.pf` combined with `srgb.pf`, sampled on a 65^3 grid) -> 8-bit
+//! sRGB -> EnhancedBlackPrinting (Gain and Offset, Gamma, Noise Filter, Black Print; see `ebp`). The real
+//! DLL does exactly this; without the EBP stages the renders have ~1.3x too much contrast and a shadow toe.
 
 use std::sync::OnceLock;
 
@@ -10,236 +9,131 @@ use ndarray::Array3;
 use rayon::prelude::*;
 
 use crate::colour::Table;
-use crate::ebp::{self, FPlanes, Gamma, Planes};
-
-/// rpd_24.pf -> romm.pf, 65^3 u16 (`assets/make_psi24_tables.py`).
-pub const RPD24_ROMM_U16: &[u8] = include_bytes!("../assets/rpd_24.romm65.u16");
-/// romm.pf -> Kodak srgb.pf, 65^3 u16.
-pub const ROMM_SRGB_U16: &[u8] = include_bytes!("../assets/romm.kodaksrgb65.u16");
+use crate::ebp::{self, FPlanes, Gamma, HqOptions, Planes};
 
 /// The real Kodak CMM, `SpCombineXforms(rpd.pf, srgb.pf)` sampled with `SpEvaluate` (output type 5,
-/// u16 full range) on a 65^3 grid of 12-bit inputs: cmm_in (SCP LUT + shifts) -> sRGB, one table
-/// (`assets/make_psi24_tables.py`, Windows `psi24-cmm`). Replaces the LittleCMS rpd -> romm -> srgb pair and
-/// the fitted `PRE_R/G/B`: against the real s0 it is MAE 0.19/0.27/0.31 (the pair was 1.75/1.18/1.08).
+/// u16 full range) on a 65^3 grid of 12-bit inputs: cmm_in (SCP LUT + shifts) -> sRGB, R-major
+/// (`assets/make_psi24_tables.py`, Windows `psi24-cmm`). Used for the float planes of the HQ path.
 pub const CMM65_U16: &[u8] = include_bytes!("../assets/cmm65.u16");
 
-/// The same grid with `SpEvaluate` output type 1 (u8, what the DLL's render uses; stored as u8*257 so
-/// `Table::from_u16_le` gives u8/255). Type 5 lifts the shadows by +0.5..+0.9 u8 levels against it
-/// (review #4), so the exact 8-bit path and the 8-bit decisions of the HQ path use this one.
-pub const CMM65_U8: &[u8] = include_bytes!("../assets/cmm65_u8.u16");
+/// The same grid with `SpEvaluate` output type 1 (u8, what the DLL's render uses). Type 5 lifts the
+/// shadows by +0.5..+0.9 u8 levels against it, so the exact 8-bit path and the 8-bit decisions of the
+/// HQ path use this one.
+pub const CMM65_U8: &[u8] = include_bytes!("../assets/cmm65_u8.u8");
 
 pub struct Tables {
-    pub rpd_romm: Table,
-    pub romm_srgb: Table,
+    /// type 5 (u16), float output
     pub cmm: Table,
+    /// type 1 (u8), the DLL's 8-bit output
     pub cmm8: Table,
-}
-
-/// 12-bit value -> table coordinate. The grid nodes are at `round(i*4095/64)`; warping the input to those
-/// exact node positions was tried (review #4) and was worse on both held-out rolls (0.975 -> 1.000 exact MAE,
-/// suite 0.62 -> 0.71), so the uniform coordinate stays.
-#[inline]
-fn node_x(v: f32) -> f32 {
-    v / 4095.0
-}
-
-#[inline]
-fn cmm_at(tab: &Table, row: &[f32], x: usize) -> [f32; 3] {
-    let q = [node_x(row[3 * x]), node_x(row[3 * x + 1]), node_x(row[3 * x + 2])];
-    static TRI: OnceLock<bool> = OnceLock::new();
-    if *TRI.get_or_init(|| std::env::var("PSI24_TRILIN").is_ok()) { tab.lookup(q) } else { tab.lookup_tetra(q) }
-}
-
-/// `PSI24_CMM_T5=1`: use the type-5 table for the 8-bit path too (A/B only).
-fn cmm_t5() -> bool {
-    static O: OnceLock<bool> = OnceLock::new();
-    *O.get_or_init(|| std::env::var("PSI24_CMM_T5").is_ok())
-}
-
-/// `PSI24_OLD_TABLES=1` goes back to the LittleCMS pair + `PRE_R/G/B` (A/B comparisons only).
-fn old_tables() -> bool {
-    static O: OnceLock<bool> = OnceLock::new();
-    *O.get_or_init(|| std::env::var("PSI24_OLD_TABLES").is_ok())
 }
 
 pub fn tables() -> &'static Tables {
     static T: OnceLock<Tables> = OnceLock::new();
     T.get_or_init(|| Tables {
-        rpd_romm: Table::from_u16_le(65, RPD24_ROMM_U16).expect("rpd_24.romm65.u16"),
-        romm_srgb: Table::from_u16_le(65, ROMM_SRGB_U16).expect("romm.kodaksrgb65.u16"),
         cmm: Table::from_u16_le(65, CMM65_U16).expect("cmm65.u16"),
-        cmm8: Table::from_u16_le(65, CMM65_U8).expect("cmm65_u8.u16"),
+        cmm8: Table::from_u8(65, CMM65_U8).expect("cmm65_u8.u8"),
     })
 }
 
+/// Tetrahedral lookup of a 12-bit RPD triple (`x / 4095` is the table coordinate; warping the input to
+/// the exact node positions `round(i*4095/64)` was tried and was worse on both held-out rolls).
+#[inline]
+fn cmm_at(tab: &Table, row: &[f32], x: usize) -> [f32; 3] {
+    tab.lookup_tetra([row[3 * x] / 4095.0, row[3 * x + 1] / 4095.0, row[3 * x + 2] / 4095.0])
+}
+
 /// Gamma exponent ceiling of the automatic estimator. At full resolution the
-/// estimate is within ~0.03 of the best fit on the four reference frames
-/// (0.96 / 0.70 / 0.70 / 0.73 against 0.93 / 0.68 / 0.65 / 0.72), but the edge
+/// estimate is within ~0.03 of the best fit on the reference frames, but the edge
 /// statistic it uses is resolution dependent (frame 1 estimates 1.19 on a 1/4
 /// subsample), so a preview could overshoot: capped at 1.0.
 pub const GAMMA_CAP: f64 = 1.0;
 
-/// RPD field (rows of interleaved f32, 0..4095) -> 8-bit-equivalent 16-bit
-/// sRGB (H, W, 3), like `colour::render_oem_scp`'s output.
-pub fn render(rpd: &[Vec<f32>], gamma: Gamma) -> (Array3<u16>, f64) {
+/// `v` 0..1 -> the 8-bit level on the 12-bit plane scale (`level << 4`), rounded like the DLL's u8 output.
+#[inline]
+fn q8(v: f32) -> u16 {
+    ((v * 255.0 + 0.5).clamp(0.0, 255.0) as u16) << 4
+}
+
+/// The 8-bit sRGB image entering EBP (planar, `level << 4`): RPD field (rows of interleaved f32, 0..4095)
+/// through the sampled Kodak CMM, rounded to 8 bit. `psi24_stage`/analysis code compares this with the
+/// real `s0` dumps.
+pub fn pre_ebp(rpd: &[Vec<f32>]) -> Planes {
+    pre_ebp_planes(rpd, false).0
+}
+
+/// [`pre_ebp`] plus, when `float` is set, the same image from the type-5 table without rounding
+/// (0..255 scale), for the HQ path.
+fn pre_ebp_planes(rpd: &[Vec<f32>], float: bool) -> (Planes, Option<FPlanes>) {
     let t = tables();
     let h = rpd.len();
     let w = if h > 0 { rpd[0].len() / 3 } else { 0 };
-    let mut pl = Planes::new(w, h);
-    // The DLL's EBP runs on 8-bit sRGB (see `ebp::set_plain8`): convert first.
-    // `PSI24_ROMM12=1` keeps the old 12-bit ROMM path for comparisons.
-    let e8 = std::env::var("PSI24_ROMM12").is_err();
-    ebp::set_plain8(e8);
-    if e8 && !old_tables() {
-        // cmm_in -> sRGB in one step through the sampled Kodak CMM, rounded to 8 bit like the DLL's u8 output
-        let dump = std::env::var("PSI24_DUMP_PREF").ok();
-        let mut raw = if dump.is_some() { vec![0f32; 3 * w * h] } else { Vec::new() };
-        {
-            let [pr, pg, pb] = &mut pl.p;
-            pr.par_chunks_mut(w.max(1)).zip(pg.par_chunks_mut(w.max(1))).zip(pb.par_chunks_mut(w.max(1))).enumerate().for_each(|(y, ((r, g), b))| {
-                let row = &rpd[y];
-                for x in 0..w {
-                    let s = cmm_at(if cmm_t5() { &t.cmm } else { &t.cmm8 }, row, x);
-                    r[x] = ((s[0] * 255.0 + 0.5).clamp(0.0, 255.0) as u16) << 4;
-                    g[x] = ((s[1] * 255.0 + 0.5).clamp(0.0, 255.0) as u16) << 4;
-                    b[x] = ((s[2] * 255.0 + 0.5).clamp(0.0, 255.0) as u16) << 4;
-                }
-            });
-        }
-        if let Some(path) = dump {
-            for y in 0..h {
-                for x in 0..w {
-                    let s = cmm_at(&t.cmm8, &rpd[y], x);
-                    for c in 0..3 {
-                        raw[c * w * h + y * w + x] = s[c] * 255.0;
-                    }
-                }
+    let mut q = Planes::new(w, h);
+    let mut f = float.then(|| FPlanes { w, h, p: std::array::from_fn(|_| vec![0f32; w * h]) });
+    if w == 0 {
+        return (q, f);
+    }
+    let [qr, qg, qb] = &mut q.p;
+    let rows = qr.par_chunks_mut(w).zip(qg.par_chunks_mut(w)).zip(qb.par_chunks_mut(w));
+    match f.as_mut() {
+        None => rows.enumerate().for_each(|(y, ((qr, qg), qb))| {
+            for x in 0..w {
+                let s8 = cmm_at(&t.cmm8, &rpd[y], x);
+                (qr[x], qg[x], qb[x]) = (q8(s8[0]), q8(s8[1]), q8(s8[2]));
             }
-            std::fs::write(path, raw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
-        }
-    } else {
-        {
-            let [pr, pg, pb] = &mut pl.p;
-            pr.par_chunks_mut(w.max(1)).zip(pg.par_chunks_mut(w.max(1))).zip(pb.par_chunks_mut(w.max(1))).enumerate().for_each(|(y, ((r, g), b))| {
-                let row = &rpd[y];
+        }),
+        Some(f) => {
+            let [fr, fg, fb] = &mut f.p;
+            rows.zip(fr.par_chunks_mut(w).zip(fg.par_chunks_mut(w)).zip(fb.par_chunks_mut(w))).enumerate().for_each(|(y, (((qr, qg), qb), ((fr, fg), fb)))| {
                 for x in 0..w {
-                    let s = t.rpd_romm.lookup([row[3 * x] / 4095.0, row[3 * x + 1] / 4095.0, row[3 * x + 2] / 4095.0]);
-                    r[x] = to12(s[0]);
-                    g[x] = to12(s[1]);
-                    b[x] = to12(s[2]);
-                }
-            });
-        }
-        let corr = std::env::var("PSI24_NO_PRECORR").is_err();
-        if let (Ok(path), true) = (std::env::var("PSI24_DUMP_PREF"), e8) {
-            // unrounded 8-bit-scale sRGB (before the pre-EBP correction), planar f32 LE
-            let mut o = Vec::with_capacity(12 * w * h);
-            for c in 0..3 {
-                for i in 0..w * h {
-                    let s = t.romm_srgb.lookup([pl.p[0][i] as f32 / 4095.0, pl.p[1][i] as f32 / 4095.0, pl.p[2][i] as f32 / 4095.0]);
-                    o.extend_from_slice(&(s[c] * 255.0).to_le_bytes());
-                }
-            }
-            std::fs::write(path, o).unwrap();
-        }
-        if e8 && w > 0 {
-            let [pr, pg, pb] = &mut pl.p;
-            pr.par_chunks_mut(w).zip(pg.par_chunks_mut(w)).zip(pb.par_chunks_mut(w)).for_each(|((r, g), b)| {
-                for x in 0..w {
-                    let s = t.romm_srgb.lookup([r[x] as f32 / 4095.0, g[x] as f32 / 4095.0, b[x] as f32 / 4095.0]);
-                    let (r8, g8, b8) = (s[0] * 255.0, s[1] * 255.0, s[2] * 255.0);
-                    let k = if corr { 1.0 } else { 0.0 };
-                    r[x] = ((r8 + k * pre_corr(r8, &PRE_R, false) + 0.5).clamp(0.0, 255.0) as u16) << 4;
-                    g[x] = ((g8 + k * pre_corr(g8, &PRE_G, true) + 0.5).clamp(0.0, 255.0) as u16) << 4;
-                    b[x] = ((b8 + k * pre_corr(b8, &PRE_B, true) + 0.5).clamp(0.0, 255.0) as u16) << 4;
+                    let s = cmm_at(&t.cmm, &rpd[y], x);
+                    let s8 = cmm_at(&t.cmm8, &rpd[y], x);
+                    (qr[x], qg[x], qb[x]) = (q8(s8[0]), q8(s8[1]), q8(s8[2]));
+                    (fr[x], fg[x], fb[x]) = ((s[0] * 255.0).clamp(0.0, 255.0), (s[1] * 255.0).clamp(0.0, 255.0), (s[2] * 255.0).clamp(0.0, 255.0));
                 }
             });
         }
     }
-    if let (Ok(path), true) = (std::env::var("PSI24_DUMP_PRE"), e8) {
-        // planar 8-bit sRGB entering EBP (for comparing with the real stage dumps)
-        let mut o = Vec::with_capacity(3 * w * h);
-        for c in 0..3 {
-            o.extend(pl.p[c].iter().map(|&v| (v >> 4) as u8));
-        }
-        std::fs::write(path, o).unwrap();
-    }
+    (q, f)
+}
+
+/// RPD field (rows of interleaved f32, 0..4095) -> 8-bit-equivalent 16-bit sRGB (H, W, 3), like
+/// `colour::render_oem_scp`'s output. Returns the Gamma exponent used.
+pub fn render(rpd: &[Vec<f32>], gamma: Gamma) -> (Array3<u16>, f64) {
+    let h = rpd.len();
+    let w = if h > 0 { rpd[0].len() / 3 } else { 0 };
+    let mut pl = pre_ebp(rpd);
     let used = if w > 0 { ebp::enhanced_black_printing(&mut pl, gamma).1 } else { 1.0 };
     let mut out = Array3::<u16>::zeros((h, w, 3));
     out.axis_iter_mut(ndarray::Axis(0)).into_par_iter().enumerate().for_each(|(y, mut orow)| {
         for x in 0..w {
-            let i = y * w + x;
-            if e8 {
-                for c in 0..3 {
-                    orow[(x, c)] = (pl.p[c][i] >> 4).min(255) * 257;
-                }
-                continue;
-            }
-            let s = t.romm_srgb.lookup([pl.p[0][i] as f32 / 4095.0, pl.p[1][i] as f32 / 4095.0, pl.p[2][i] as f32 / 4095.0]);
             for c in 0..3 {
-                orow[(x, c)] = (s[c] * 65535.0 + 0.5).clamp(0.0, 65535.0) as u16;
+                orow[(x, c)] = (pl.p[c][y * w + x] >> 4).min(255) * 257;
             }
         }
     });
     (out, used)
 }
 
-
 /// High-bit-depth render: same pipeline and decisions as [`render`], but the 8-bit EBP stages run
-/// continuously on float planes ([`ebp::hq_apply`]) and nothing is quantised between the ICC
-/// tables (16-bit, trilinear in f64) and the output. Returns sRGB on a 0..255 float scale plus the
-/// Gamma exponent. All parameter decisions come from the exact 8-bit chain (run on a clone).
+/// continuously on float planes ([`ebp::hq_apply`]) and nothing is quantised between the CMM and the
+/// output. Returns sRGB on a 0..255 float scale plus the Gamma exponent. All parameter decisions come
+/// from the exact 8-bit chain (run on the rounded planes).
 pub fn render_hq_f32(rpd: &[Vec<f32>], gamma: Gamma) -> (Vec<Vec<f32>>, usize, usize, f64) {
-    let t = tables();
+    render_hq_f32_with(rpd, gamma, HqOptions::default())
+}
+
+pub fn render_hq_f32_with(rpd: &[Vec<f32>], gamma: Gamma, opts: HqOptions) -> (Vec<Vec<f32>>, usize, usize, f64) {
     let h = rpd.len();
     let w = if h > 0 { rpd[0].len() / 3 } else { 0 };
     if w == 0 {
         return (vec![], 0, h, 1.0);
     }
-    let corr = std::env::var("PSI24_NO_PRECORR").is_err();
-    let old = old_tables();
-    let (sr, sg, sb) = (smooth_pre(&PRE_R), smooth_pre(&PRE_G), smooth_pre(&PRE_B));
-    let mut f = FPlanes { w, h, p: std::array::from_fn(|_| vec![0f32; w * h]) };
-    let mut q8 = Planes::new(w, h);
-    {
-        let [fr, fg, fb] = &mut f.p;
-        let [qr, qg, qb] = &mut q8.p;
-        fr.par_chunks_mut(w).zip(fg.par_chunks_mut(w)).zip(fb.par_chunks_mut(w)).zip(qr.par_chunks_mut(w).zip(qg.par_chunks_mut(w)).zip(qb.par_chunks_mut(w))).enumerate().for_each(|(y, (((fr, fg), fb), ((qr, qg), qb)))| {
-            let row = &rpd[y];
-            for x in 0..w {
-                if !old {
-                    // one sampled Kodak CMM table: exact 8-bit decisions from the rounded value, HQ planes from the float
-                    let s = cmm_at(&t.cmm, row, x);
-                    let s8 = cmm_at(if cmm_t5() { &t.cmm } else { &t.cmm8 }, row, x);
-                    let q = |v: f32| ((v * 255.0 + 0.5).clamp(0.0, 255.0) as u16) << 4;
-                    qr[x] = q(s8[0]);
-                    qg[x] = q(s8[1]);
-                    qb[x] = q(s8[2]);
-                    fr[x] = (s[0] * 255.0).clamp(0.0, 255.0);
-                    fg[x] = (s[1] * 255.0).clamp(0.0, 255.0);
-                    fb[x] = (s[2] * 255.0).clamp(0.0, 255.0);
-                    continue;
-                }
-                let rm = t.rpd_romm.lookup([row[3 * x] / 4095.0, row[3 * x + 1] / 4095.0, row[3 * x + 2] / 4095.0]);
-                // exact statistics path: the 12-bit ROMM round trip, 8-bit rounding (like `render`)
-                let s = t.romm_srgb.lookup([to12(rm[0]) as f32 / 4095.0, to12(rm[1]) as f32 / 4095.0, to12(rm[2]) as f32 / 4095.0]);
-                let c8 = |v: f32, k: &[f32; 16], fade: bool| v * 255.0 + if corr { pre_corr(v * 255.0, k, fade) } else { 0.0 };
-                let (r8, g8, b8) = (c8(s[0], &PRE_R, false), c8(s[1], &PRE_G, true), c8(s[2], &PRE_B, true));
-                qr[x] = ((r8 + 0.5).clamp(0.0, 255.0) as u16) << 4;
-                qg[x] = ((g8 + 0.5).clamp(0.0, 255.0) as u16) << 4;
-                qb[x] = ((b8 + 0.5).clamp(0.0, 255.0) as u16) << 4;
-                // HQ path: no 12-bit round trip, continuous correction, no rounding
-                let s = t.romm_srgb.lookup(rm);
-                fr[x] = c8(s[0], &sr, false).clamp(0.0, 255.0);
-                fg[x] = c8(s[1], &sg, true).clamp(0.0, 255.0);
-                fb[x] = c8(s[2], &sb, true).clamp(0.0, 255.0);
-            }
-        });
-    }
-    ebp::set_plain8(true);
-    let params = ebp::hq_params(&mut q8, gamma);
-    drop(q8);
-    ebp::hq_apply(&mut f, &params);
+    let (mut q, f) = pre_ebp_planes(rpd, true);
+    let mut f = f.unwrap();
+    let params = ebp::hq_params(&mut q, gamma);
+    drop(q);
+    ebp::hq_apply(&mut f, &params, opts);
     let rows: Vec<Vec<f32>> = (0..h)
         .map(|y| {
             let mut row = Vec::with_capacity(3 * w);
@@ -268,63 +162,9 @@ pub fn render_hq(rpd: &[Vec<f32>], gamma: Gamma) -> (Array3<u16>, f64) {
     (out, g)
 }
 
-/// Measured difference (real - ours) of the 8-bit sRGB entering EBP, at knots 0, 16, .. 240 per
-/// channel. Fitted by quantile (histogram) matching of our pre-EBP channel against the real `s0`
-/// dumps, pooled over all four reference frames (the Gain & Offset stage is histogram driven, and
-/// matching the histograms beats a least-squares / per-pixel fit end to end; knot 0 is kept from the
-/// previous fit, too few pixels). The per-frame curves agree to ~0.5 level. Our `rpd.pf -> romm.pf ->
-/// srgb.pf` tables are about 2-4 levels low in the highlights and 1-3 high in the shadows against the
-/// DLL; skipping the 12-bit ROMM round trip changes the output by only 0.02-0.04 levels, so it is not
-/// the cause (see PSI24_RE_NOTES section 5).
-const PRE_R: [f32; 16] = [2.12, 2.24, 1.71, 0.90, 1.29, 2.11, 1.37, 2.90, 2.07, 3.12, 3.60, 3.61, 3.43, 4.16, 4.08, 4.19];
-const PRE_G: [f32; 16] = [-0.39, -0.39, -1.18, -1.01, -0.64, 0.54, -0.04, 0.99, 1.04, 1.22, 1.98, 2.20, 2.19, 2.82, 2.77, 2.47];
-const PRE_B: [f32; 16] = [-1.59, -1.64, -2.00, -1.35, -1.28, -0.29, -0.84, 0.47, 0.40, 0.51, 1.58, 1.56, 1.50, 2.12, 1.99, 1.83];
-
-/// `[1 6 1] / 8` smoothing of a PRE table (end knots kept): the fitted tables have a sawtooth
-/// (histogram quantile matching on a discrete 16-level grid) that the HQ path does not need to follow.
-fn smooth_pre(k: &[f32; 16]) -> [f32; 16] {
-    if std::env::var("PSI24_HQ_NOSMOOTH").is_ok() {
-        return *k;
-    }
-    let mut o = *k;
-    for i in 1..15 {
-        o[i] = (k[i - 1] + 6.0 * k[i] + k[i + 1]) * 0.125;
-    }
-    o
-}
-
-fn pre_corr(v: f32, k: &[f32; 16], fade: bool) -> f32 {
-    let x = (v / 16.0).clamp(0.0, 15.0);
-    let i = (x as usize).min(14);
-    let f = x - i as f32;
-    // G and B fade out over the last 7 levels: the DLL leaves them just under 255 where the red
-    // is already clipped, and pushing them into the clipped bin flips the white-point branch of
-    // Gain & Offset (probe P3b_c1800_s1000).
-    (k[i] * (1.0 - f) + k[i + 1] * f) * if fade { ((255.0 - v) / 7.0).clamp(0.0, 1.0) } else { 1.0 }
-}
-
-#[inline]
-fn to12(v: f32) -> u16 {
-    (v * 4095.0 + 0.5).clamp(0.0, 4095.0) as u16
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tables_load_and_neutral_ramp_is_monotonic() {
-        let t = tables();
-        let mut last = [-1.0f32; 3];
-        for i in 0..=40 {
-            let x = 0.2 + 0.6 * i as f32 / 40.0;
-            let s = t.romm_srgb.lookup(t.rpd_romm.lookup([x; 3]));
-            for c in 0..3 {
-                assert!(s[c] >= last[c] - 1e-4, "ch {c} not monotonic at {x}");
-                last[c] = s[c];
-            }
-        }
-    }
 
     #[test]
     fn cmm_tables_load_and_agree_on_the_neutral_ramp() {
@@ -387,5 +227,75 @@ mod tests {
         for c in 0..3 {
             assert!(o.indexed_iter().all(|((_, _, k), &v)| k != c || v == o[(0, 0, c)]), "channel {c} not flat");
         }
+    }
+
+    /// Deterministic synthetic RPD fields (fixed xorshift) that between them reach every branch of the stages:
+    /// a narrow dark noisy field (knee, Gamma g2, noisy Noise Filter, Black Print), a bright high-contrast one
+    /// with sharp edges (Gamma g1 edge statistic) and a smooth full-range one (stage 1 only, flat Noise Filter).
+    fn synth(kind: usize) -> Vec<Vec<f32>> {
+        let (w, h) = (128usize, 96usize);
+        let mut s = 0x9E3779B9u32 ^ (kind as u32 * 0x85EBCA6B);
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            (s >> 8) as f32 / (1u32 << 24) as f32
+        };
+        (0..h)
+            .map(|y| {
+                (0..3 * w)
+                    .map(|i| {
+                        let (x, c) = (i / 3, i % 3);
+                        let v = match kind {
+                            0 => 500.0 + 700.0 * (x as f32 / w as f32) + (rnd() - 0.5) * 160.0 + c as f32 * 40.0,
+                            1 => {
+                                let blk = ((x / 16 + y / 16) % 2) as f32;
+                                1500.0 + blk * 1400.0 + (rnd() - 0.5) * 40.0 - c as f32 * 60.0
+                            }
+                            _ => 300.0 + 2700.0 * ((x + y) as f32 / (w + h) as f32) + c as f32 * 30.0,
+                        };
+                        v.clamp(0.0, 4095.0)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn fnv(v: impl Iterator<Item = u16>) -> u64 {
+        v.fold(0xcbf29ce484222325u64, |h, x| (h ^ x as u64).wrapping_mul(0x100000001b3))
+    }
+
+    /// Guards refactors: the exact and HQ outputs of the synthetic fields, bit for bit. A deliberate change of
+    /// the maths has to update these values (and say why).
+    #[test]
+    fn golden_hashes_of_synthetic_fields() {
+        const GOLDEN: [(u64, u64); 3] = [
+            (0x49607797a565f9f4, 0xb1a86b2b09f619e7),
+            (0x5c698b634dc4ec67, 0xbe47d2cf5b41460e),
+            (0x5065b5d7e62b7422, 0xf213892c5e21de13),
+        ];
+        let mut got = vec![];
+        for kind in 0..3 {
+            let rpd = synth(kind);
+            let (e, ge) = render(&rpd, Gamma::Auto { cap: 9.0 });
+            let (q, gq) = render_hq(&rpd, Gamma::Auto { cap: 9.0 });
+            assert_eq!(ge, gq);
+            got.push((fnv(e.iter().copied()), fnv(q.iter().copied())));
+            eprintln!("kind {kind}: gamma {ge:.4} exact {:016x} hq {:016x}", got[kind].0, got[kind].1);
+        }
+        assert_eq!(got, GOLDEN);
+    }
+
+    /// The synthetic fields keep reaching the branches they were made for.
+    #[test]
+    fn synthetic_fields_cover_the_stage_branches() {
+        let mut pl = pre_ebp(&synth(0));
+        assert!(ebp::gain_and_offset(&mut pl).knee.is_some(), "narrow field: knee");
+        let mut pl = pre_ebp(&synth(2));
+        assert!(ebp::gain_and_offset(&mut pl).knee.is_none(), "full-range field: stage 1 only");
+        assert!(ebp::estimate_gamma(&pl).gamma > 1.0, "bright field: g1");
+        let mut pl = pre_ebp(&synth(0));
+        ebp::gain_and_offset(&mut pl);
+        assert!(ebp::estimate_gamma(&pl).gamma < 1.0, "dark field: g2");
     }
 }
