@@ -393,18 +393,18 @@ pub fn estimate_gamma(img: &Planes) -> GammaEstimate {
             let q7: Vec<i32> = l8.iter().map(|v| v << 7).collect();
             let b5 = blur_floor(&q7, w, h, &[1, 4, 6, 4, 1], 4);
             let b35 = blur_floor(&b5, w, h, &[1, 2, 1], 2);
-            let ss: f64 = (0..n).into_par_iter().map(|i| ((b35[i] - b5[i]) as f64).powi(2)).sum();
-            let sig = (ss / (n.max(2) - 1) as f64).sqrt();
+            let ss: u64 = (0..n).into_par_iter().map(|i| { let d = (b35[i] - b5[i]) as i64; (d * d) as u64 }).sum();
+            let sig = (ss as f64 / (n.max(2) - 1) as f64).sqrt();
             let thr = (sig * EDGE_THR + 0.5) as i32;
-            let (mut sum, mut cnt) = (0f64, 0u64);
+            let (mut sum, mut cnt) = (0u64, 0u64);
             for i in 0..n {
                 if (b35[i] - b5[i]).abs() > thr {
-                    sum += ((b5[i] + 64) >> 7) as f64;
+                    sum += ((b5[i] + 64) >> 7) as u64;
                     cnt += 1;
                 }
             }
             if cnt > 0 {
-                let e = sum / cnt as f64 / 255.0;
+                let e = sum as f64 / cnt as f64 / 255.0;
                 if e.ln() != 0.0 {
                     g1 = ((mean_hi_pct() * 0.01 + e) * 0.5).ln() / e.ln();
                 }
