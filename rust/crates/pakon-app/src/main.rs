@@ -229,7 +229,7 @@ fn pick(w: &Window, kind: Pick, start: Option<PathBuf>) -> Option<PathBuf> {
     }
     match kind {
         Pick::Folder => d.set_title("Choose the work folder").pick_folder(),
-        Pick::Raw => d.set_title("Open a raw").add_filter("Pakon raw", &["raw"]).pick_file(),
+        Pick::Raw => d.set_title("Open a raw").add_filter("Pakon raw", &["raw", "pakscan"]).pick_file(),
     }
 }
 

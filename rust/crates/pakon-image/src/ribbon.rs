@@ -10,25 +10,60 @@ use crate::decode::{self, Layout, Leads};
 use crate::flat::{self, FlatJson};
 use crate::ice;
 
-/// A raw scan file, memory-mapped as little-endian u16 samples.
+/// A raw scan file (`.raw` or `PKLB` `.pakscan` container), memory-mapped as
+/// little-endian u16 samples.
 pub struct Raw {
     map: Mmap,
+    range: std::ops::Range<usize>,
+}
+
+const PKLB_MAGIC: &[u8; 4] = b"PKLB";
+const PKLB_HEADER_LEN: usize = 0x54;
+
+fn pklb_raw_range(bytes: &[u8]) -> std::io::Result<std::ops::Range<usize>> {
+    let invalid = |msg: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+    if bytes.len() < PKLB_HEADER_LEN {
+        return Err(invalid("truncated PKLB .pakscan header"));
+    }
+    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    if version != 1 {
+        return Err(invalid(&format!("unsupported PKLB .pakscan version {version}")));
+    }
+    let offset = u64::from_le_bytes(bytes[0x3c..0x44].try_into().unwrap()) as usize;
+    let len = u64::from_le_bytes(bytes[0x44..0x4c].try_into().unwrap()) as usize;
+    let end = offset.checked_add(len).ok_or_else(|| invalid("PKLB raw range overflow"))?;
+    if offset % 2 != 0 || len < 2 || end > bytes.len() {
+        return Err(invalid("invalid PKLB raw payload range"));
+    }
+    Ok(offset..end)
 }
 
 impl Raw {
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Raw> {
+        let path = path.as_ref();
         let f = std::fs::File::open(path)?;
         // SAFETY: the raw is only read; a file truncated underneath us would
         // fault, as numpy's memmap would.
         let map = unsafe { Mmap::map(&f)? };
-        Ok(Raw { map })
+        let range = if map.starts_with(PKLB_MAGIC) {
+            pklb_raw_range(&map)?
+        } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pakscan")) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unsupported .pakscan file (expected PKLB raw container)",
+            ));
+        } else {
+            0..map.len()
+        };
+        Ok(Raw { map, range })
     }
 
     /// The samples. Raws are written by our own tools on little-endian hosts;
-    /// the map is page-aligned, so the cast is aligned.
+    /// the map is page-aligned and PKLB raw offsets are even, so the cast is
+    /// aligned.
     pub fn samples(&self) -> &[u16] {
-        let (pre, mid, _) = unsafe { self.map.align_to::<u16>() };
-        assert!(pre.is_empty(), "mmap is page aligned");
+        let (pre, mid, _) = unsafe { self.map[self.range.clone()].align_to::<u16>() };
+        assert!(pre.is_empty(), "raw slice is 2-byte aligned");
         const { assert!(cfg!(target_endian = "little"), "raws are little-endian") };
         mid
     }
@@ -121,4 +156,39 @@ pub fn build(raw_path: &Path, opt: &Options, progress: &mut dyn FnMut(&str, f64)
         }
     }
     Ok(Ribbon { rgb, ir, flat: flat_json, info: RibbonInfo { layout, marker, leads, leads_measured, flat: applied } })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_open_reads_pklb_pakscan_payload() {
+        let dir = std::env::temp_dir().join(format!("pakon-pklb-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("roll.pakscan");
+
+        let offset: u64 = 0x80;
+        let samples: [u16; 6] = [100, 200, 300, 400, 500, 600];
+        let payload_len = (samples.len() * 2) as u64;
+        let mut buf = vec![0u8; offset as usize + payload_len as usize + 16];
+        buf[0..4].copy_from_slice(b"PKLB");
+        buf[4..8].copy_from_slice(&1u32.to_le_bytes());
+        buf[0x3c..0x44].copy_from_slice(&offset.to_le_bytes());
+        buf[0x44..0x4c].copy_from_slice(&payload_len.to_le_bytes());
+        for (i, &s) in samples.iter().enumerate() {
+            let at = offset as usize + i * 2;
+            buf[at..at + 2].copy_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(&p, &buf).unwrap();
+
+        let raw = Raw::open(&p).unwrap();
+        assert_eq!(raw.samples(), &samples);
+
+        let bad = dir.join("not_pklb.pakscan");
+        std::fs::write(&bad, b"NOT_PKLB_DATA_HERE").unwrap();
+        assert!(Raw::open(&bad).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

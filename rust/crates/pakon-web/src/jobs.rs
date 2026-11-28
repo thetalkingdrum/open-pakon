@@ -173,9 +173,11 @@ pub async fn api_open(State(app): State<Arc<App>>, body: Bytes) -> Response {
     let f = fields(&body);
     let Some(path) = f.get("path").and_then(Value::as_str) else { return missing("path") };
     let raw = expand_user(path);
-    let is_raw = raw.extension().is_some_and(|e| e.eq_ignore_ascii_case("raw"));
+    let is_raw = raw
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("raw") || e.eq_ignore_ascii_case("pakscan"));
     if !is_raw || !raw.is_file() {
-        return error(StatusCode::BAD_REQUEST, format!("not a .raw file: {}", raw.display()));
+        return error(StatusCode::BAD_REQUEST, format!("not a .raw or .pakscan file: {}", raw.display()));
     }
     let raw = resolve(&raw);
     let mut roll = app.roll();
@@ -233,7 +235,15 @@ pub async fn api_process(State(app): State<Arc<App>>, body: Bytes) -> Response {
         move |app, meta| {
             // hand the browser everything it needs to place crops (no ribbon path)
             let all = serde_json::to_value(&meta).unwrap_or_default();
-            let mut event = json!({"type": "done", "saved": load_crops(&raw, meta.rows, meta.moved.as_ref())});
+            let mut saved = load_crops(&raw, meta.rows, meta.moved.as_ref());
+            if saved.is_null() && meta.preframed && !meta.centres.is_empty() {
+                saved = json!({
+                    "rows": meta.rows,
+                    "centres": meta.centres,
+                    "widths": vec![meta.frame_w; meta.centres.len()],
+                });
+            }
+            let mut event = json!({"type": "done", "saved": saved});
             for key in ["rows", "cols", "pitch", "frame_w", "box_w", "preview_w", "preview_h", "scale", "film", "format", "ice", "strips", "dx_order", "adjustable", "first_frame"] {
                 event[key] = all[key].clone();
             }
@@ -249,7 +259,7 @@ pub async fn api_process(State(app): State<Arc<App>>, body: Bytes) -> Response {
 pub async fn api_autoframe(State(app): State<Arc<App>>, body: Bytes) -> Response {
     let f = fields(&body);
     let format = f.get("format").and_then(Value::as_str).unwrap_or("full").to_string();
-    let (ribbon, film, raw, strips) = {
+    let (ribbon, film, raw, strips, preframed) = {
         let roll = app.roll();
         let Some(meta) = &roll.prescan else {
             return error(StatusCode::BAD_REQUEST, "Process a roll first");
@@ -260,8 +270,17 @@ pub async fn api_autoframe(State(app): State<Arc<App>>, body: Bytes) -> Response
         if roll.processing {
             return error(StatusCode::CONFLICT, "Already processing");
         }
-        (PathBuf::from(&meta.ribbon), meta.film, roll.scan_path.clone(), meta.strips.clone())
+        let pf = meta.preframed.then(|| pakon_roll::Autoframe {
+            centres: meta.centres.clone(),
+            frame_w: meta.frame_w,
+            pitch: meta.pitch,
+            format: meta.format,
+        });
+        (PathBuf::from(&meta.ribbon), meta.film, roll.scan_path.clone(), meta.strips.clone(), pf)
     };
+    if let Some(found) = preframed {
+        return Json(found).into_response();
+    }
     let (me, fmt) = (app.clone(), frame_format(&format));
     let found = tokio::task::spawn_blocking(move || {
         let _one = me.jobs.lock().unwrap_or_else(|e| e.into_inner());

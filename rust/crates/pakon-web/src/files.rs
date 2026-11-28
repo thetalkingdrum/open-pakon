@@ -204,7 +204,12 @@ pub async fn api_browse(Query(q): Query<BrowseQuery>) -> Response {
     let base = Some(resolve(&start)).filter(|b| b.is_dir()).unwrap_or_else(|| resolve(&home()));
     let dirs = sorted_names(&base, |p, n| p.is_dir() && !n.starts_with('.'));
     let files = if raws {
-        sorted_names(&base, |p, n| p.is_file() && Path::new(n).extension().is_some_and(|e| e.eq_ignore_ascii_case("raw")))
+        sorted_names(&base, |p, n| {
+            p.is_file()
+                && Path::new(n)
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("raw") || e.eq_ignore_ascii_case("pakscan"))
+        })
     } else {
         vec![]
     };

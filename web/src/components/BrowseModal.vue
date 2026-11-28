@@ -54,7 +54,7 @@ const item = 'flex cursor-pointer items-center gap-2.5 border-b border-ink px-5 
 </script>
 
 <template>
-  <Modal v-if="browse.open" :title="browse.raws ? 'Open a .raw' : 'Choose work folder'" @close="close">
+  <Modal v-if="browse.open" :title="browse.raws ? 'Open a .raw / .pakscan' : 'Choose work folder'" @close="close">
     <!-- right-to-left so a long path is cut at its start; the LRM marks keep
          the leading "/" in place -->
     <div class="truncate border-b-2 border-ink bg-surface-2 px-5 py-2.5 text-left font-mono text-small font-semibold [direction:rtl]"

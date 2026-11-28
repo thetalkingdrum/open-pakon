@@ -335,6 +335,10 @@ pub struct Meta {
     /// has none, only the turn and flips.
     #[serde(default)]
     pub adjustable: bool,
+    /// Pre-framed roll (e.g. TLX planar `.raw` folder): frames are already
+    /// cropped at exact `centres` / `frame_w`, so autoframe keeps them as-is.
+    #[serde(default)]
+    pub preframed: bool,
 }
 
 /// The SBA parameter file for the raw's DX code, and the strip's film base
@@ -441,42 +445,51 @@ pub fn prescan(env: &Env, raw: &Path, film: FilmKind, fmt: Format, progress: Opt
 
     let opt = ribbon::Options { layout: env.layout, eeprom_dir: env.eeprom_dir.clone(), no_flat: env.no_flat };
     let mut prog = |s: &str, p: f64| emit(progress, s, p);
-    let r = ribbon::build(raw, &opt, &mut prog)?;
-    let plan = strips::plan_for_raw(raw, r.rgb.len_of(Axis(0)), r.info.layout.row_samples);
-    // Strips fed out of film order or with leader dropped: the cached
-    // ribbon is written from the plan's row ranges, streamed into the .npy,
-    // and used from there.
-    let reorder = plan.as_ref().filter(|p| p.repacked());
-    let ribbon_npy;
-    let owned;
-    let rgb: ArrayView3<u16> = match reorder {
-        Some(p) => {
+    let (ribbon_npy, owned, plan, ice_plane, tlx_frames): (
+        Option<Npy>,
+        Option<Array3<u16>>,
+        Option<strips::Plan>,
+        Option<(Array2<u16>, pakon_image::flat::FlatJson)>,
+        Option<(usize, usize)>,
+    ) = if pakon_image::tlx::probe(raw).is_some() {
+        let t = pakon_image::tlx::build_ribbon(raw, &mut prog)?;
+        (None, Some(t.rgb), None, None, Some((t.frame_w, t.frame_count)))
+    } else {
+        let r = ribbon::build(raw, &opt, &mut prog)?;
+        let plan = strips::plan_for_raw(raw, r.rgb.len_of(Axis(0)), r.info.layout.row_samples);
+        // Silver B&W gets no dust removal: the silver image blocks infrared as
+        // dust does, so a B&W raw scanned with the IR channel (or processed as
+        // B&W afterwards) came out wrecked. Slides get it as colour negative
+        // does; one known roll over-cleans its blown highlights
+        // (docs/SLIDE_ICE.md).
+        let ice_plane = if film == FilmKind::Bw { None } else { r.ir.zip(r.flat) };
+        if let Some(p) = plan.as_ref().filter(|p| p.repacked()) {
             emit(progress, if p.reordered { "Putting the strips in film order" } else { "Trimming the strips" }, 0.58);
             strips::write_rows3(&env.ribbon_path(), r.rgb.view(), &p.ranges)?;
             drop(r.rgb);
-            ribbon_npy = Npy::open(&env.ribbon_path())?;
-            ribbon_npy.view3()?
+            (Some(Npy::open(&env.ribbon_path())?), None, plan, ice_plane, None)
+        } else {
+            (None, Some(r.rgb), plan, ice_plane, None)
         }
-        None => {
-            owned = r.rgb;
-            owned.view()
-        }
+    };
+    let reorder = plan.as_ref().filter(|p| p.repacked());
+    let rgb: ArrayView3<u16> = match (&ribbon_npy, &owned) {
+        (Some(n), _) => n.view3()?,
+        (_, Some(a)) => a.view(),
+        _ => unreachable!(),
     };
     let strip_list: Vec<StripInfo> = plan.as_ref().map(|p| p.strips.clone()).unwrap_or_default();
     let (rows, cols, _) = rgb.dim();
-    // Silver B&W gets no dust removal: the silver image blocks infrared as
-    // dust does, so a B&W raw scanned with the IR channel (or processed as
-    // B&W afterwards) came out wrecked. Slides get it as colour negative
-    // does; one known roll over-cleans its blown highlights
-    // (docs/SLIDE_ICE.md).
-    let ice_plane = if film == FilmKind::Bw { None } else { r.ir.zip(r.flat) };
 
     emit(progress, "Measuring film base", 0.62);
     let base = balance::dmin(rgb.view());
 
     emit(progress, "Detecting frames", 0.68);
     let box_w: HashMap<String, usize> = Format::ALL.iter().map(|f| (f.name().to_string(), framing::geometry(cols, *f).1)).collect();
-    let (starts, mut frame_w, mut pitch) = strips::frame_strips(rgb.view(), &strip_list, film == FilmKind::Slide, fmt);
+    let (starts, mut frame_w, mut pitch) = match tlx_frames {
+        Some((fw, count)) => ((0..count).map(|i| i * fw).collect(), fw, fw),
+        None => strips::frame_strips(rgb.view(), &strip_list, film == FilmKind::Slide, fmt),
+    };
     let first_frame = starts.iter().min().copied();
     let mut centres: Vec<i64> = starts.iter().map(|&s| (s + frame_w / 2) as i64).collect();
     if centres.is_empty() {
@@ -581,6 +594,7 @@ pub fn prescan(env: &Env, raw: &Path, film: FilmKind, fmt: Format, progress: Opt
         moved: plan.and_then(|p| p.moved),
         strips: strip_list,
         adjustable: film == FilmKind::Slide || oem.is_some(),
+        preframed: tlx_frames.is_some(),
     })
 }
 
